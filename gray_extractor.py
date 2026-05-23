@@ -125,31 +125,34 @@ class MultiChannelExtractor:
 
     @staticmethod
     def group_boxes(boxes: list):
-        """Return list of groups, each group = list of box indices that overlap >=50%.
-        Boxes within a group are parallel (same strata), groups are sequential."""
+        """Return list of groups, each group = list of box indices at the same
+        stratigraphic level. Uses center-distance: two boxes are grouped if
+        their vertical centers are within 35% of the shorter box's height.
+
+        This correctly separates:
+        - Parallel boxes (side-by-side, same level) → averaged
+        - Sequential boxes (one above the other) → concatenated
+        """
         if not boxes:
             return []
-        groups = []
+        centers = [y + h / 2 for (_, y, _, h) in boxes]
         used = set()
-        for i, (_, y_i, _, h_i) in enumerate(boxes):
+        groups = []
+        for i in range(len(boxes)):
             if i in used:
                 continue
             group = [i]
             used.add(i)
-            top_i, bottom_i = y_i, y_i + h_i
-            for j, (_, y_j, _, h_j) in enumerate(boxes):
+            _, y_i, _, h_i = boxes[i]
+            for j in range(len(boxes)):
                 if j in used:
                     continue
-                top_j, bottom_j = y_j, y_j + h_j
-                overlap = min(bottom_i, bottom_j) - max(top_i, top_j)
-                span_i = bottom_i - top_i
-                span_j = bottom_j - top_j
-                min_span = min(span_i, span_j)
-                if min_span > 0 and overlap / min_span >= 0.5:
+                _, y_j, _, h_j = boxes[j]
+                dist = abs(centers[i] - centers[j])
+                min_h = min(h_i, h_j)
+                if min_h > 0 and dist < 0.35 * min_h:
                     group.append(j)
                     used.add(j)
-                    top_i = min(top_i, top_j)
-                    bottom_i = max(bottom_i, bottom_j)
             groups.append(group)
         return groups
 
@@ -178,33 +181,8 @@ class MultiChannelExtractor:
             raw_profiles.append(
                 MultiChannelExtractor.extract_single(image_bgr, inner_rect))
 
-        # Step 2 — Group overlapping boxes
-        groups = []  # list of lists: [[box_idx, ...], ...]
-        used = set()
-
-        for i, (_, y_i, _, h_i) in enumerate(boxes):
-            if i in used:
-                continue
-            group = [i]
-            used.add(i)
-            top_i, bottom_i = y_i, y_i + h_i
-
-            for j, (_, y_j, _, h_j) in enumerate(boxes):
-                if j in used:
-                    continue
-                top_j, bottom_j = y_j, y_j + h_j
-                overlap = min(bottom_i, bottom_j) - max(top_i, top_j)
-                span_i = bottom_i - top_i
-                span_j = bottom_j - top_j
-                min_span = min(span_i, span_j)
-                if min_span > 0 and overlap / min_span >= 0.5:
-                    group.append(j)
-                    used.add(j)
-                    # Expand the reference span for subsequent comparisons
-                    top_i = min(top_i, top_j)
-                    bottom_i = max(bottom_i, bottom_j)
-
-            groups.append(group)
+        # Step 2 — Group boxes using center-distance logic
+        groups = MultiChannelExtractor.group_boxes(boxes)
 
         # Step 3 — Build merged profiles
         all_profiles = {ch: [] for ch in MultiChannelExtractor.CHANNELS}
