@@ -680,7 +680,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._load_image(path)
 
     def _load_image(self, path: str):
+        # Try OpenCV first, fall back to PIL (handles RGBA, CMYK, etc.)
         self.image_bgr = cv2.imread(path)
+        if self.image_bgr is None:
+            try:
+                from PIL import Image
+                pil = Image.open(path)
+                if pil.mode in ('RGBA', 'LA', 'P'):
+                    pil = pil.convert('RGB')
+                self.image_bgr = cv2.cvtColor(
+                    np.array(pil), cv2.COLOR_RGB2BGR)
+            except Exception:
+                pass
         if self.image_bgr is None:
             QtWidgets.QMessageBox.critical(self, "Error",
                 f"Cannot open image:\n{path}\n\nCheck file format.")
