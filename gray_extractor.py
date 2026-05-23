@@ -39,20 +39,28 @@ class MultiChannelExtractor:
     """Extract 6-channel profiles from rectangular ROIs."""
 
     CHANNELS = ["gray", "redness", "greenness", "blueness", "L_star", "a_star"]
+    MARGIN = 4  # px to trim from each edge — skips the red border line itself
 
     @staticmethod
     def extract_single(image_bgr: np.ndarray, roi: tuple):
         """Extract all 6 channels from one ROI.
-        Returns dict mapping channel name → 1D float32 array.
+        Applies MARGIN inward trim to exclude the red border line.
         """
         x, y, w, h = roi
-        roi_img = image_bgr[y:y + h, x:x + w].astype(np.float32)
+        m = MultiChannelExtractor.MARGIN
+        # Trim inward to skip red border pixels
+        x1, y1 = x + m, y + m
+        x2, y2 = x + w - m, y + h - m
+        if x2 <= x1 or y2 <= y1:
+            # ROI too small after trimming — fall back to original
+            x1, y1, x2, y2 = x, y, x + w, y + h
+        roi_img = image_bgr[y1:y2, x1:x2].astype(np.float32)
 
         # RGB channels
         B = roi_img[:, :, 0]
         G = roi_img[:, :, 1]
         R = roi_img[:, :, 2]
-        total = R + G + B + 1e-6  # avoid div-by-zero
+        total = R + G + B + 1e-6
 
         # Row-wise means
         profiles = {}
@@ -61,32 +69,119 @@ class MultiChannelExtractor:
         profiles["greenness"] = np.mean(G / total, axis=1)
         profiles["blueness"] = np.mean(B / total, axis=1)
 
-        # CIE L*a*b* (simplified using OpenCV — needs uint8 input)
-        roi_uint8 = image_bgr[y:y + h, x:x + w]
+        # CIE L*a*b* — needs uint8 input on the trimmed ROI
+        roi_uint8 = image_bgr[y1:y2, x1:x2]
         lab = cv2.cvtColor(roi_uint8, cv2.COLOR_BGR2Lab).astype(np.float32)
-        profiles["L_star"] = np.mean(lab[:, :, 0], axis=1)   # 0–100
-        profiles["a_star"] = np.mean(lab[:, :, 1], axis=1)   # -128 to +128
+        profiles["L_star"] = np.mean(lab[:, :, 0], axis=1)
+        profiles["a_star"] = np.mean(lab[:, :, 1], axis=1)
 
         return profiles
 
     @staticmethod
+    def group_boxes(boxes: list):
+        """Return list of groups, each group = list of box indices that overlap >=50%.
+        Boxes within a group are parallel (same strata), groups are sequential."""
+        if not boxes:
+            return []
+        groups = []
+        used = set()
+        for i, (_, y_i, _, h_i) in enumerate(boxes):
+            if i in used:
+                continue
+            group = [i]
+            used.add(i)
+            top_i, bottom_i = y_i, y_i + h_i
+            for j, (_, y_j, _, h_j) in enumerate(boxes):
+                if j in used:
+                    continue
+                top_j, bottom_j = y_j, y_j + h_j
+                overlap = min(bottom_i, bottom_j) - max(top_i, top_j)
+                span_i = bottom_i - top_i
+                span_j = bottom_j - top_j
+                min_span = min(span_i, span_j)
+                if min_span > 0 and overlap / min_span >= 0.5:
+                    group.append(j)
+                    used.add(j)
+                    top_i = min(top_i, top_j)
+                    bottom_i = max(bottom_i, bottom_j)
+            groups.append(group)
+        return groups
+
+    @staticmethod
     def extract_all(image_bgr: np.ndarray, boxes: list):
-        """Extract all channels from all boxes, return concatenated arrays.
-        Returns: profiles_dict {channel: 1D array}, segments list
+        """Extract all channels from all boxes, handling overlapping boxes.
+        Boxes that overlap vertically (>=50% overlap) are averaged — they
+        are parallel views of the same strata, not sequential segments.
+        Non-overlapping boxes are concatenated in stratigraphic order.
         """
+        if not boxes:
+            return {ch: np.array([]) for ch in MultiChannelExtractor.CHANNELS}, []
+
+        # Step 1 — Extract raw profiles from each box
+        raw_profiles = []
+        for box in boxes:
+            raw_profiles.append(
+                MultiChannelExtractor.extract_single(image_bgr, box))
+
+        # Step 2 — Group overlapping boxes
+        groups = []  # list of lists: [[box_idx, ...], ...]
+        used = set()
+
+        for i, (_, y_i, _, h_i) in enumerate(boxes):
+            if i in used:
+                continue
+            group = [i]
+            used.add(i)
+            top_i, bottom_i = y_i, y_i + h_i
+
+            for j, (_, y_j, _, h_j) in enumerate(boxes):
+                if j in used:
+                    continue
+                top_j, bottom_j = y_j, y_j + h_j
+                overlap = min(bottom_i, bottom_j) - max(top_i, top_j)
+                span_i = bottom_i - top_i
+                span_j = bottom_j - top_j
+                min_span = min(span_i, span_j)
+                if min_span > 0 and overlap / min_span >= 0.5:
+                    group.append(j)
+                    used.add(j)
+                    # Expand the reference span for subsequent comparisons
+                    top_i = min(top_i, top_j)
+                    bottom_i = max(bottom_i, bottom_j)
+
+            groups.append(group)
+
+        # Step 3 — Build merged profiles
         all_profiles = {ch: [] for ch in MultiChannelExtractor.CHANNELS}
         segments = []
         offset = 0
-        for i, box in enumerate(boxes):
-            profiles = MultiChannelExtractor.extract_single(image_bgr, box)
-            n = len(profiles["gray"])
+
+        for group in groups:
+            if len(group) == 1:
+                # Single box — use directly
+                idx = group[0]
+                prof = raw_profiles[idx]
+            else:
+                # Multiple overlapping boxes — average them
+                # First, pad all to the same length (max height in group)
+                max_h = max(len(raw_profiles[i]["gray"]) for i in group)
+                prof = {}
+                for ch in MultiChannelExtractor.CHANNELS:
+                    padded = np.full((len(group), max_h), np.nan)
+                    for k, idx in enumerate(group):
+                        data = raw_profiles[idx][ch]
+                        padded[k, :len(data)] = data
+                    prof[ch] = np.nanmean(padded, axis=0)
+
+            n = len(prof["gray"])
             for ch in MultiChannelExtractor.CHANNELS:
-                all_profiles[ch].append(profiles[ch])
-            segments.append((offset, offset + n, i))
+                all_profiles[ch].append(prof[ch])
+            # Segment metadata: use the first box's index as label
+            segments.append((offset, offset + n, group[0]))
             offset += n
-        if offset == 0:
-            return {ch: np.array([]) for ch in MultiChannelExtractor.CHANNELS}, []
-        return {ch: np.concatenate(all_profiles[ch]) for ch in MultiChannelExtractor.CHANNELS}, segments
+
+        return {ch: np.concatenate(all_profiles[ch])
+                for ch in MultiChannelExtractor.CHANNELS}, segments
 
 
 class IlluminationCorrector:
@@ -293,14 +388,20 @@ class BoxListWidget(QtWidgets.QWidget):
         layout.addLayout(btn_layout)
         self._boxes = []
 
-    def set_boxes(self, boxes):
+    def set_boxes(self, boxes, groups=None):
         self._boxes = boxes
         self.list_widget.clear()
-        for i, (x, y, w, h) in enumerate(boxes):
-            color = BOX_COLORS[i % len(BOX_COLORS)]
-            item = QtWidgets.QListWidgetItem(f"Box {i+1}  @ ({x},{y})  {w}×{h} px  [{h} rows]")
-            item.setForeground(QtGui.QColor(color))
-            self.list_widget.addItem(item)
+        if groups is None:
+            groups = [list(range(len(boxes)))]
+        for g_idx, group in enumerate(groups):
+            color = BOX_COLORS[g_idx % len(BOX_COLORS)]
+            for pos, box_idx in enumerate(group):
+                x, y, w, h = boxes[box_idx]
+                lbl = f"G{g_idx+1}#{pos+1}" if len(group) > 1 else f"Box {box_idx+1}"
+                item = QtWidgets.QListWidgetItem(
+                    f"{lbl}  @ ({x},{y})  {w}×{h} px  [{h} rows]")
+                item.setForeground(QtGui.QColor(color))
+                self.list_widget.addItem(item)
 
     def get_boxes(self):
         return self._boxes
@@ -560,20 +661,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.info_label.setText("No red boxes detected.")
             self.status_bar.showMessage("WARNING: No red boxes found")
         else:
-            # Draw boxes + connectors
-            for i, (x, y, w, h) in enumerate(self.boxes):
-                color_bgr = self._hex_to_bgr(BOX_COLORS[i % len(BOX_COLORS)])
-                cv2.rectangle(display, (x, y), (x + w, y + h), color_bgr, 3)
-                lbl = f"#{i+1}"
-                (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)
-                cv2.rectangle(display, (x, y - lh - 10), (x + lw + 6, y), color_bgr, -1)
-                cv2.putText(display, lbl, (x + 3, y - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-            for i in range(len(self.boxes) - 1):
-                x1, y1, w1, h1 = self.boxes[i]
-                x2, y2, w2, h2 = self.boxes[i + 1]
+            # ── Compute groups: overlapping boxes share a group ──
+            groups = MultiChannelExtractor.group_boxes(self.boxes)
+
+            # Draw box borders — group color, label like "G1#1"
+            for g_idx, group in enumerate(groups):
+                color_bgr = self._hex_to_bgr(BOX_COLORS[g_idx % len(BOX_COLORS)])
+                for pos, box_idx in enumerate(group):
+                    x, y, w, h = self.boxes[box_idx]
+                    cv2.rectangle(display, (x, y), (x + w, y + h), color_bgr, 3)
+                    lbl = f"G{g_idx+1}#{pos+1}" if len(group) > 1 else f"#{box_idx+1}"
+                    (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)
+                    cv2.rectangle(display, (x, y - lh - 10), (x + lw + 6, y), color_bgr, -1)
+                    cv2.putText(display, lbl, (x + 3, y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+            # Draw arrows between groups (not within groups)
+            for g_idx in range(len(groups) - 1):
+                # Last box of current group
+                last_box = groups[g_idx][-1]
+                x1, y1, w1, h1 = self.boxes[last_box]
+                # First box of next group
+                first_box = groups[g_idx + 1][0]
+                x2, y2, w2, h2 = self.boxes[first_box]
                 cv2.arrowedLine(display, (x1 + w1 // 2, y1 + h1),
-                                (x2 + w2 // 2, y2), (100, 100, 100), 2, tipLength=0.04)
+                                (x2 + w2 // 2, y2),
+                                (80, 80, 80), 2, tipLength=0.04)
 
             # Draw depth calibration markers if set
             if self.calibrator.is_calibrated:
@@ -589,20 +702,30 @@ class MainWindow(QtWidgets.QMainWindow):
             # Extract
             self.profiles, self.segments = MultiChannelExtractor.extract_all(
                 self.image_bgr, self.boxes)
-            self.box_list.set_boxes(self.boxes)
+            # Update box list with group-aware display
+            self.box_list.set_boxes(self.boxes, groups)
 
             n = len(self.profiles.get("gray", []))
-            info = f"Detected: {len(self.boxes)} box(es)\nProfile: {n} rows\n"
+            info = f"Boxes: {len(self.boxes)}  →  {len(groups)} group(s)  →  Profile: {n} rows\n"
+            info += "─" * 40 + "\n"
             if self.calibrator.is_calibrated:
                 td = self.calibrator.top_depth_m
                 bd = self.calibrator.bottom_depth_m
                 info += f"Depth: {td:.2f} – {bd:.2f} m  ({abs(bd-td):.2f} m span)\n"
-            info += "\n".join(
-                f"  Box {j+1}: ({x},{y}) {w}×{h} px"
-                for j, (x, y, w, h) in enumerate(self.boxes))
+            for g_idx, group in enumerate(groups):
+                grp_label = f"Group {g_idx+1}"
+                if len(group) == 1:
+                    x, y, w, h = self.boxes[group[0]]
+                    info += f"  {grp_label}: 1 box @ ({x},{y}) {w}×{h} px\n"
+                else:
+                    info += f"  {grp_label}: {len(group)} overlapping boxes → averaged\n"
+                    for pos, box_idx in enumerate(group):
+                        x, y, w, h = self.boxes[box_idx]
+                        info += f"    #{box_idx+1}: ({x},{y}) {w}×{h} px\n"
+            info += "\n— Groups = parallel strata (averaged)\n— Arrow = sequential strata (concatenated)"
             self.info_label.setText(info)
             self.status_bar.showMessage(
-                f"{len(self.boxes)} box(es)  |  "
+                f"{len(groups)} group(s)  |  "
                 f"{n} rows  |  6 channels")
 
         self._refresh_plot()
@@ -743,19 +866,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         display = self.image_bgr.copy()
         if self.boxes:
-            for i, (x, y, w, h) in enumerate(self.boxes):
-                cb = self._hex_to_bgr(BOX_COLORS[i % len(BOX_COLORS)])
-                cv2.rectangle(display, (x, y), (x + w, y + h), cb, 3)
-                lbl = f"#{i+1}"
-                (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)
-                cv2.rectangle(display, (x, y - lh - 10), (x + lw + 6, y), cb, -1)
-                cv2.putText(display, lbl, (x + 3, y - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-            for i in range(len(self.boxes) - 1):
-                x1, y1, w1, h1 = self.boxes[i]
-                x2, y2, w2, h2 = self.boxes[i + 1]
+            groups = MultiChannelExtractor.group_boxes(self.boxes)
+            for g_idx, group in enumerate(groups):
+                cb = self._hex_to_bgr(BOX_COLORS[g_idx % len(BOX_COLORS)])
+                for pos, box_idx in enumerate(group):
+                    x, y, w, h = self.boxes[box_idx]
+                    cv2.rectangle(display, (x, y), (x + w, y + h), cb, 3)
+                    lbl = f"G{g_idx+1}#{pos+1}" if len(group) > 1 else f"#{box_idx+1}"
+                    (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)
+                    cv2.rectangle(display, (x, y - lh - 10), (x + lw + 6, y), cb, -1)
+                    cv2.putText(display, lbl, (x + 3, y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            for g_idx in range(len(groups) - 1):
+                last_box = groups[g_idx][-1]
+                x1, y1, w1, h1 = self.boxes[last_box]
+                first_box = groups[g_idx + 1][0]
+                x2, y2, w2, h2 = self.boxes[first_box]
                 cv2.arrowedLine(display, (x1 + w1 // 2, y1 + h1),
-                                (x2 + w2 // 2, y2), (100, 100, 100), 2, tipLength=0.04)
+                                (x2 + w2 // 2, y2), (80, 80, 80), 2, tipLength=0.04)
             if self.calibrator.is_calibrated:
                 ty, by = self.calibrator.top_y, self.calibrator.bottom_y
                 for pv, lb in [(ty, "Top"), (by, "Bottom")]:
