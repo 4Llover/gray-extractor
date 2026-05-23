@@ -1,0 +1,27 @@
+# Byte-compiled
+__pycache__/
+*.pyc
+*.pyo
+
+# Test / dev scripts
+_test*.py
+detect_box.py
+check_env.py
+
+# Data — images are large, CSV is generated output
+data/*.jpg
+data/*.jpeg
+data/*.png
+data/*.tiff
+data/*.tif
+data/*.csv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
