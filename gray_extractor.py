@@ -39,38 +39,84 @@ class MultiChannelExtractor:
     """Extract 6-channel profiles from rectangular ROIs."""
 
     CHANNELS = ["gray", "redness", "greenness", "blueness", "L_star", "a_star"]
-    MARGIN = 4  # px to trim from each edge — skips the red border line itself
+
+    @staticmethod
+    def inner_roi(red_mask: np.ndarray, outer_rect: tuple,
+                  min_frac: float = 0.15, max_scan: int = 20):
+        """Scan inward from each edge to find where the red border ends.
+
+        To avoid false positives from red rock markings (spray paint),
+        each edge is scanned only in a narrow central band:
+        - top/bottom: scan only columns [w/4 .. 3w/4]
+        - left/right: scan only rows [h/4 .. 3h/4]
+
+        Max scan distance limits how far we search before falling back
+        to a conservative 3px trim (handles photos with internal red marks).
+
+        Returns: (ix, iy, iw, ih) inner rectangle.
+        """
+        x, y, w, h = outer_rect
+        roi = red_mask[y:y + h, x:x + w]
+        col_a, col_b = w // 4, 3 * w // 4
+        row_a, row_b = h // 4, 3 * h // 4
+
+        def _scan_edge(direction, limit):
+            n = limit
+            for i in range(limit):
+                if direction == 'top':
+                    strip = roi[i, col_a:col_b]
+                elif direction == 'bottom':
+                    strip = roi[h - 1 - i, col_a:col_b]
+                elif direction == 'left':
+                    strip = roi[row_a:row_b, i]
+                else:  # 'right'
+                    strip = roi[row_a:row_b, w - 1 - i]
+                if np.count_nonzero(strip) / max(len(strip), 1) < min_frac:
+                    n = i
+                    break
+            return n
+
+        top_i = _scan_edge('top', max_scan)
+        bot_i = _scan_edge('bottom', max_scan)
+        left_i = _scan_edge('left', max_scan)
+        right_i = _scan_edge('right', max_scan)
+
+        # If scanner hit the limit (red everywhere), fall back to 3px
+        if top_i >= max_scan:
+            top_i = 3
+        if bot_i >= max_scan:
+            bot_i = 3
+        if left_i >= max_scan:
+            left_i = 3
+        if right_i >= max_scan:
+            right_i = 3
+
+        ix, iy = x + left_i, y + top_i
+        iw = (w - right_i) - left_i
+        ih = (h - bot_i) - top_i
+        if iw < 10 or ih < 20:
+            return outer_rect
+        return (ix, iy, iw, ih)
 
     @staticmethod
     def extract_single(image_bgr: np.ndarray, roi: tuple):
         """Extract all 6 channels from one ROI.
-        Applies MARGIN inward trim to exclude the red border line.
-        """
+        roi must be the INNER rectangle (after border trimming)."""
         x, y, w, h = roi
-        m = MultiChannelExtractor.MARGIN
-        # Trim inward to skip red border pixels
-        x1, y1 = x + m, y + m
-        x2, y2 = x + w - m, y + h - m
-        if x2 <= x1 or y2 <= y1:
-            # ROI too small after trimming — fall back to original
-            x1, y1, x2, y2 = x, y, x + w, y + h
-        roi_img = image_bgr[y1:y2, x1:x2].astype(np.float32)
+        roi_img = image_bgr[y:y + h, x:x + w].astype(np.float32)
 
-        # RGB channels
         B = roi_img[:, :, 0]
         G = roi_img[:, :, 1]
         R = roi_img[:, :, 2]
         total = R + G + B + 1e-6
 
-        # Row-wise means
         profiles = {}
         profiles["gray"] = np.mean(0.299 * R + 0.587 * G + 0.114 * B, axis=1)
         profiles["redness"] = np.mean(R / total, axis=1)
         profiles["greenness"] = np.mean(G / total, axis=1)
         profiles["blueness"] = np.mean(B / total, axis=1)
 
-        # CIE L*a*b* — needs uint8 input on the trimmed ROI
-        roi_uint8 = image_bgr[y1:y2, x1:x2]
+        roi_uint8 = image_bgr[y:y + h, x:x + w]
         lab = cv2.cvtColor(roi_uint8, cv2.COLOR_BGR2Lab).astype(np.float32)
         profiles["L_star"] = np.mean(lab[:, :, 0], axis=1)
         profiles["a_star"] = np.mean(lab[:, :, 1], axis=1)
@@ -108,8 +154,11 @@ class MultiChannelExtractor:
         return groups
 
     @staticmethod
-    def extract_all(image_bgr: np.ndarray, boxes: list):
+    def extract_all(image_bgr: np.ndarray, boxes: list, red_mask: np.ndarray = None):
         """Extract all channels from all boxes, handling overlapping boxes.
+        If red_mask is provided, inner_roi() is used to trim the red border
+        precisely (scanning inward from each edge).
+
         Boxes that overlap vertically (>=50% overlap) are averaged — they
         are parallel views of the same strata, not sequential segments.
         Non-overlapping boxes are concatenated in stratigraphic order.
@@ -117,11 +166,17 @@ class MultiChannelExtractor:
         if not boxes:
             return {ch: np.array([]) for ch in MultiChannelExtractor.CHANNELS}, []
 
-        # Step 1 — Extract raw profiles from each box
+        # Step 0 — Compute inner ROIs from the red mask (precise border trim)
+        if red_mask is not None:
+            inner_boxes = [MultiChannelExtractor.inner_roi(red_mask, b) for b in boxes]
+        else:
+            inner_boxes = boxes
+
+        # Step 1 — Extract raw profiles from each inner ROI
         raw_profiles = []
-        for box in boxes:
+        for inner_rect in inner_boxes:
             raw_profiles.append(
-                MultiChannelExtractor.extract_single(image_bgr, box))
+                MultiChannelExtractor.extract_single(image_bgr, inner_rect))
 
         # Step 2 — Group overlapping boxes
         groups = []  # list of lists: [[box_idx, ...], ...]
@@ -242,11 +297,11 @@ class RedBoxDetector:
         hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
         mask1 = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
         mask2 = cv2.inRange(hsv, (160, 80, 80), (180, 255, 255))
-        mask = cv2.bitwise_or(mask1, mask2)
+        raw_mask = cv2.bitwise_or(mask1, mask2)  # pre-morphology, for inner_roi
         kernel = np.ones((7, 7), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        clean_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel)
+        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_OPEN, kernel)
+        contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         boxes = []
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
@@ -255,9 +310,9 @@ class RedBoxDetector:
             if h >= 150 and area >= 5000 and aspect >= 2.0:
                 boxes.append((x, y, w, h))
         if not boxes:
-            return [], mask
+            return [], raw_mask
         boxes.sort(key=lambda b: b[1] + b[3], reverse=True)
-        return boxes, mask
+        return boxes, raw_mask
 
 
 # ═══════════════════════════════════════════════
@@ -643,6 +698,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.boxes, mask = RedBoxDetector.detect_all(self.image_bgr)
+        self.red_mask = mask  # keep for inner_roi border trimming
         self.act_calib.setEnabled(bool(self.boxes))
         self.act_illum.setEnabled(bool(self.boxes))
         self.act_export.setEnabled(bool(self.boxes))
@@ -699,14 +755,18 @@ class MainWindow(QtWidgets.QMainWindow):
                                     (10, int(py) - 5),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 140, 0), 2)
 
-            # Extract
+            # Extract (with border-trim info)
+            outer_heights = sum(b[3] for b in self.boxes)
             self.profiles, self.segments = MultiChannelExtractor.extract_all(
-                self.image_bgr, self.boxes)
+                self.image_bgr, self.boxes, self.red_mask)
+            inner_heights = sum(s[1] - s[0] for s in self.segments) if self.segments else 0
+            trimmed_px = outer_heights - inner_heights
             # Update box list with group-aware display
             self.box_list.set_boxes(self.boxes, groups)
 
             n = len(self.profiles.get("gray", []))
             info = f"Boxes: {len(self.boxes)}  →  {len(groups)} group(s)  →  Profile: {n} rows\n"
+            info += f"Border trimmed: {trimmed_px} px total ({trimmed_px//len(self.boxes)//2} px/edge avg)\n"
             info += "─" * 40 + "\n"
             if self.calibrator.is_calibrated:
                 td = self.calibrator.top_depth_m
@@ -777,7 +837,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.boxes = self.box_list.get_boxes()
         if self.image_bgr is not None and self.boxes:
             self.profiles, self.segments = MultiChannelExtractor.extract_all(
-                self.image_bgr, self.boxes)
+                self.image_bgr, self.boxes, getattr(self, 'red_mask', None))
             self._refresh_plot()
             self._redraw_image_only()
             self.status_bar.showMessage(f"Order updated — {len(self.boxes)} box(es)")
