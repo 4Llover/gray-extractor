@@ -206,63 +206,93 @@ CHANNEL_LABELS = {"gray":"Gray (0–255)","redness":"R/(R+G+B)","greenness":"G/(
 
 
 # ═══════════════════════════════════════════════
-#  Multi-channel plot widget (v5: depth ruler)
+#  Multi-channel plot widget (v5.2: 1-column layout)
 # ═══════════════════════════════════════════════
 
 class MultiChannelPlotWidget(FigureCanvasQTAgg):
+    """Asymmetric 3-column layout:
+       Left (wide): gray only
+       Middle (medium): L* + a* stacked
+       Right (narrow): redness, greenness, blueness stacked"""
+
+    LAYOUT = {
+        "gray":       (0, 0.40, 0.58),   # (left, width_ratio, height)
+        "L_star":     (0.42, 0.28, 0.47),
+        "a_star":     (0.42, 0.28, 0.47),
+        "redness":    (0.72, 0.26, 0.30),
+        "greenness":  (0.72, 0.26, 0.30),
+        "blueness":   (0.72, 0.26, 0.30),
+    }
+
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(8, 10), dpi=100)
+        self.figure = Figure(figsize=(14, 9), dpi=100)
         self.figure.set_facecolor('#fafafa')
         super().__init__(self.figure)
         self.setParent(parent)
         self.axes = {}
         self._create_subplots()
-        self._depth_data = None  # stored for export
+        self._depth_data = None
 
     def _create_subplots(self):
-        for i, ch in enumerate(MultiChannelExtractor.CHANNELS):
-            self.axes[ch] = self.figure.add_subplot(2, 3, i+1)
+        # Left: gray (full height)
+        self.axes["gray"] = self.figure.add_axes((0.04, 0.06, 0.34, 0.90))
+        # Middle: L_star (top half), a_star (bottom half)
+        self.axes["L_star"] = self.figure.add_axes((0.42, 0.53, 0.24, 0.43))
+        self.axes["a_star"] = self.figure.add_axes((0.42, 0.06, 0.24, 0.43))
+        # Right: redness, greenness, blueness
+        self.axes["redness"]   = self.figure.add_axes((0.70, 0.68, 0.27, 0.28))
+        self.axes["greenness"] = self.figure.add_axes((0.70, 0.37, 0.27, 0.28))
+        self.axes["blueness"]  = self.figure.add_axes((0.70, 0.06, 0.27, 0.28))
+
+    def _draw_one(self, ax, ch, data, n, segments, depth_array, illum_corrected, trend_lines):
+        color = CHANNEL_COLORS[ch]
+        y_vals = np.arange(n)
+        for ss, se, bi in segments:
+            ax.axhspan(ss, se, alpha=0.06, color=BOX_COLORS[bi % len(BOX_COLORS)])
+        ax.fill_betweenx(y_vals, data, data.min(), alpha=0.15, color=color)
+        ax.plot(data, y_vals, color=color, linewidth=0.5)
+        if illum_corrected and trend_lines and ch in trend_lines:
+            ax.plot(trend_lines[ch], y_vals, '--', color='#999', linewidth=0.8, alpha=0.7)
+        ax.axvline(float(np.mean(data)), color=color, linestyle=':', linewidth=0.8, alpha=0.6)
+        ax.invert_yaxis()
+        title_size = 9 if ch == "gray" else 8
+        label_size = 7 if ch == "gray" else 6
+        ax.set_xlabel(CHANNEL_LABELS.get(ch, ch), fontsize=label_size)
+        ax.set_title(ch, fontsize=title_size, fontweight='bold', color=color)
+        ax.grid(True, alpha=0.2, linestyle='--')
+        ax.tick_params(labelsize=label_size - 1)
+
+        # Depth ruler
+        if depth_array is not None and len(depth_array) == n:
+            n_ticks = 10 if ch == "gray" else 6
+            step = max(1, n // n_ticks)
+            tick_rows = list(range(0, n, step))
+            tick_labels = [f"{depth_array[i]:.2f}" for i in tick_rows]
+            ax.set_yticks(tick_rows)
+            ax.set_yticklabels(tick_labels, fontsize=5)
+            if ch == "gray":
+                ax.set_ylabel("Depth (m)", fontsize=7)
+            # Segment boundary markers — fix: label beside the LINE
+            for ss, se, bi in segments:
+                if ss > 0:
+                    ax.axhline(ss, color='#F0B429', linestyle='-', linewidth=1.0, alpha=0.5)
+                    # Place label at the golden line position, not at inverted-axes position
+                    ax.annotate(f'{depth_array[min(ss, n-1)]:.2f}m',
+                                xy=(0.98, ss), xycoords=('axes fraction', 'data'),
+                                fontsize=5, color='#F0B429', ha='right', va='center',
+                                bbox=dict(boxstyle='round,pad=0.1', facecolor='white', alpha=0.7, edgecolor='none'))
 
     def plot(self, profiles, segments, depth_array=None, illum_corrected=False, trend_lines=None):
         self._depth_data = (profiles, segments, depth_array, illum_corrected, trend_lines)
         for ch in MultiChannelExtractor.CHANNELS:
             ax = self.axes[ch]; ax.clear()
             data = profiles.get(ch)
-            if data is None or len(data)==0:
-                ax.text(0.5,0.5,'No data',transform=ax.transAxes,ha='center',va='center',fontsize=10,color='gray')
-                ax.set_title(ch, fontsize=9, fontweight='bold'); continue
-            n = len(data); color = CHANNEL_COLORS[ch]
-            y_vals = np.arange(n)
-            for ss, se, bi in segments:
-                ax.axhspan(ss, se, alpha=0.06, color=BOX_COLORS[bi%len(BOX_COLORS)])
-            ax.fill_betweenx(y_vals, data, data.min(), alpha=0.15, color=color)
-            ax.plot(data, y_vals, color=color, linewidth=0.5)
-            if illum_corrected and trend_lines and ch in trend_lines:
-                ax.plot(trend_lines[ch], y_vals, '--', color='#999', linewidth=0.8, alpha=0.7)
-            ax.axvline(float(np.mean(data)), color=color, linestyle=':', linewidth=0.8, alpha=0.6)
-            ax.invert_yaxis()
-            ax.set_xlabel(CHANNEL_LABELS.get(ch, ch), fontsize=7)
-            ax.set_title(ch, fontsize=9, fontweight='bold', color=color)
-            ax.grid(True, alpha=0.2, linestyle='--'); ax.tick_params(labelsize=7)
-
-            # ── v5.1: Per-group depth ruler ──
-            if depth_array is not None and len(depth_array) == n:
-                n_ticks = 8
-                step = max(1, n // n_ticks)
-                tick_rows = list(range(0, n, step))
-                tick_labels = [f"{depth_array[i]:.2f}" for i in tick_rows]
-                ax.set_yticks(tick_rows)
-                ax.set_yticklabels(tick_labels, fontsize=6)
-                ax.set_ylabel("Depth (m)", fontsize=7)
-                # Segment boundary markers
-                for ss, se, bi in segments:
-                    if ss > 0:
-                        ax.axhline(ss, color='#F0B429', linestyle='-', linewidth=1.0, alpha=0.5)
-                        ax.text(0.02, ss/n, f'{depth_array[min(ss,n-1)]:.2f}m',
-                                transform=ax.transAxes, fontsize=6, color='#F0B429',
-                                va='center', clip_on=False)
-
-        self.figure.tight_layout(pad=2.0)
+            if data is None or len(data) == 0:
+                ax.text(0.5, 0.5, 'No data', transform=ax.transAxes, ha='center', va='center',
+                        fontsize=10, color='gray')
+                ax.set_title(ch, fontsize=8, fontweight='bold')
+                continue
+            self._draw_one(ax, ch, data, len(data), segments, depth_array, illum_corrected, trend_lines)
         self.draw()
 
     def save_plots(self, path):
@@ -364,6 +394,176 @@ class BoxListWidget(QtWidgets.QWidget):
 
 
 # ═══════════════════════════════════════════════
+#  Overlap merge dialog
+# ═══════════════════════════════════════════════
+
+class OverlapMergeDialog(QtWidgets.QDialog):
+    """Shown when two box groups have overlapping depth ranges.
+    User chooses: mean (default), keep A, keep B."""
+
+    def __init__(self, overlaps, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Depth Overlap Detected")
+        self.setMinimumWidth(450)
+        self._choice = "mean"
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(QtWidgets.QLabel(
+            "<b>Overlapping depth ranges found between groups!</b>"))
+        layout.addWidget(QtWidgets.QLabel(
+            "This is expected when you intentionally overlap boxes to\n"
+            "connect discontinuous outcrop sections."))
+
+        for ga, gb, om in overlaps:
+            layout.addWidget(QtWidgets.QLabel(
+                f"  Group {ga+1} & Group {gb+1}: overlap {om:.2f} m"))
+
+        layout.addWidget(QtWidgets.QLabel(
+            "<br><b>How to handle the overlap?</b>"))
+        self.radio_mean = QtWidgets.QRadioButton("Take Mean of both (recommended)")
+        self.radio_mean.setChecked(True)
+        self.radio_a = QtWidgets.QRadioButton("Keep Group A only")
+        self.radio_b = QtWidgets.QRadioButton("Keep Group B only")
+
+        bg = QtWidgets.QButtonGroup(self)
+        bg.addButton(self.radio_mean); bg.addButton(self.radio_a); bg.addButton(self.radio_b)
+
+        layout.addWidget(self.radio_mean)
+        layout.addWidget(self.radio_a)
+        layout.addWidget(self.radio_b)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _on_accept(self):
+        if self.radio_mean.isChecked(): self._choice = "mean"
+        elif self.radio_a.isChecked(): self._choice = "keep_a"
+        else: self._choice = "keep_b"
+        self.accept()
+
+    def choice(self):
+        return self._choice
+
+
+# ═══════════════════════════════════════════════
+#  Overlap merge engine
+# ═══════════════════════════════════════════════
+
+class OverlapMerger:
+    """Merge overlapping depth profiles into a continuous sequence."""
+
+    @staticmethod
+    def merge(profiles, segments, calibrator, groups, method="mean"):
+        """Build a single continuous profile from per-group depth data.
+        Returns (merged_profiles, merged_segments, depth_array, merged_info)."""
+        if not calibrator.is_calibrated:
+            return profiles, segments, None, {}
+
+        # Build per-row depth + group membership
+        gray = profiles.get("gray", np.array([]))
+        n = len(gray)
+        depth = np.zeros(n, dtype=np.float32)
+        grp_id = np.full(n, -1, dtype=int)
+
+        box2grp = {}
+        for gi, grp in enumerate(groups):
+            for bi in grp:
+                box2grp[bi] = gi
+
+        for ss, se, bi in segments:
+            gi = box2grp.get(bi, 0)
+            h = se - ss
+            local = np.arange(h, dtype=np.float64)
+            depth[ss:se] = calibrator.pixel_to_depth(local, h, gi)
+            grp_id[ss:se] = gi
+
+        # Detect overlap zones
+        sorted_groups = sorted(
+            [gi for gi in range(len(groups)) if calibrator.get_group(gi)],
+            key=lambda gi: calibrator.get_group(gi)[0])
+
+        overlap_info = {}
+        merged_results = {ch: [] for ch in MultiChannelExtractor.CHANNELS}
+        merged_segments = []
+        offset = 0
+
+        for a, b in zip(sorted_groups, sorted_groups[1:]):
+            da = calibrator.get_group(a)
+            db = calibrator.get_group(b)
+            overlap_start = max(da[0], db[0])
+            overlap_end = min(da[1], db[1])
+            if overlap_end <= overlap_start:
+                continue
+            overlap_info[(a, b)] = overlap_end - overlap_start
+
+        # Simple concatenation with overlap handling
+        ordered_segments = []
+        for gi in sorted_groups:
+            rows = np.where(grp_id == gi)[0]
+            if len(rows) == 0:
+                continue
+            ss, se = int(rows[0]), int(rows[-1]) + 1
+            ordered_segments.append((gi, ss, se, depth[ss], depth[se - 1]))
+
+        # Process overlaps: for each adjacent pair, merge the overlap zone
+        final_data = {ch: [] for ch in MultiChannelExtractor.CHANNELS}
+        final_depth = []
+        final_segs = []
+        off = 0
+
+        i = 0
+        while i < len(ordered_segments):
+            gi, ss, se, d_start, d_end = ordered_segments[i]
+            data_block = {ch: profiles[ch][ss:se].copy() for ch in MultiChannelExtractor.CHANNELS}
+            depth_block = depth[ss:se].copy()
+
+            if i + 1 < len(ordered_segments):
+                gj, ss2, se2, d2_start, d2_end = ordered_segments[i + 1]
+                key = (gi, gj) if (gi, gj) in overlap_info else (gj, gi)
+                ov = overlap_info.get(key, 0)
+                if ov > 0:
+                    # Find overlap rows in each block
+                    # In gi block: rows where depth >= d2_start
+                    # In gj block: rows where depth <= d_end
+                    mask_i = depth_block >= d2_start
+                    mask_j = depth[ss2:se2] <= d_end
+
+                    if method == "mean":
+                        # Average the overlapping portions
+                        for ch in MultiChannelExtractor.CHANNELS:
+                            data_i = profiles[ch][ss:se][mask_i]
+                            data_j = profiles[ch][ss2:se2][mask_j]
+                            mn = min(len(data_i), len(data_j))
+                            if mn > 0:
+                                avg = (data_i[:mn] + data_j[:mn]) / 2.0
+                                data_block[ch][mask_i][:mn] = avg
+                        # Remove the overlap portion from block j
+                        ordered_segments[i + 1] = (gj, ss2 + sum(mask_j),
+                                                    se2, depth[se2 - 1], d2_end)
+
+            # Append block i
+            for ch in MultiChannelExtractor.CHANNELS:
+                final_data[ch].append(data_block[ch])
+            final_depth.append(depth_block)
+            se_len = len(data_block["gray"])
+            final_segs.append((off, off + se_len, gi))
+            off += se_len
+            i += 1
+
+        if not final_data["gray"]:
+            return profiles, segments, depth, overlap_info
+
+        merged = {ch: np.concatenate(final_data[ch]) for ch in MultiChannelExtractor.CHANNELS}
+        merged_depth = np.concatenate(final_depth)
+
+        return merged, final_segs, merged_depth, overlap_info
+
+
+# ═══════════════════════════════════════════════
 #  Main window
 # ═══════════════════════════════════════════════
 
@@ -373,6 +573,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.image_bgr = None; self.boxes = []; self.profiles = {}; self.segments = []
         self.current_path = ""; self.calibrator = DepthCalibrator()
         self.illum_corrected = False; self.trend_lines = {}; self.red_mask = None
+        self._has_merged = False; self._merge_choice = "mean"
+        self.raw_profiles = None; self.raw_segments = None; self._merged_depth = None
 
         self.setWindowTitle("Gray Extractor v5.0")
         self.setMinimumSize(1200, 750); self.resize(1600, 900)
@@ -640,21 +842,43 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Depth", "Top must be < bottom depth")
             return
         self.calibrator.set_group(gi, tm, bm)
-        self._refresh_plot()
+
         groups = MultiChannelExtractor.group_boxes(self.boxes)
-        info = f"Group {gi+1} depth: {tm:.3f} – {bm:.3f} m"
-        all_cal = [g for g in range(len(groups)) if self.calibrator.get_group(g)]
-        if len(all_cal) > 1:
-            # Cross-group alignment: merge overlapping depth ranges
-            merged = []
-            for g in sorted(all_cal):
-                d = self.calibrator.get_group(g)
-                merged.append((g, d[0], d[1]))
-            merged.sort(key=lambda x: x[1])
-            for a, b in zip(merged, merged[1:]):
-                if a[2] > b[1]:
-                    overlap = a[2] - b[1]
-                    info += f"\n⚠ Group {a[0]+1} & {b[0]+1} overlap {overlap:.3f}m"
+        all_cal = sorted([g for g in range(len(groups)) if self.calibrator.get_group(g)],
+                         key=lambda g: self.calibrator.get_group(g)[0])
+
+        # ── Check for overlaps between adjacent groups ──
+        overlaps = []
+        for a, b in zip(all_cal, all_cal[1:]):
+            da = self.calibrator.get_group(a); db = self.calibrator.get_group(b)
+            ov = min(da[1], db[1]) - max(da[0], db[0])
+            if ov > 0:
+                overlaps.append((a, b, ov))
+
+        if overlaps and len(all_cal) >= 2:
+            dlg = OverlapMergeDialog(overlaps, self)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                self._merge_choice = dlg.choice()
+                # Store raw profiles before merging
+                self.raw_profiles = {ch: self.profiles[ch].copy()
+                                     for ch in MultiChannelExtractor.CHANNELS if len(self.profiles.get(ch, [])) > 0}
+                self.raw_segments = list(self.segments)
+                merged_prof, merged_seg, merged_depth, ov_info = OverlapMerger.merge(
+                    self.profiles, self.segments, self.calibrator, groups, self._merge_choice)
+                self.profiles = merged_prof
+                self.segments = merged_seg
+                self._merged_depth = merged_depth
+                self._has_merged = True
+        else:
+            self._has_merged = False
+
+        self._refresh_plot()
+        info = f"Group {gi+1}: {tm:.3f} – {bm:.3f} m"
+        if overlaps:
+            for a, b, ov in overlaps:
+                info += f"\n  Overlap G{a+1} & G{b+1}: {ov:.3f}m"
+            if hasattr(self, '_merge_choice'):
+                info += f"\n  Merged: {self._merge_choice}"
         self.sb.showMessage(info)
 
     # ── Illumination toggle ──────────────────
@@ -723,17 +947,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 local = np.arange(h, dtype=np.float64)
                 dm[ss:se] = self.calibrator.pixel_to_depth(local, h, gi)
         hdrs = ["row_px"]; hdrs += (["depth_m"] if dm is not None else [])
-        hdrs += ["box_id"] + MultiChannelExtractor.CHANNELS
+        hdrs += ["box_id"]
+        if self._has_merged:
+            for ch in MultiChannelExtractor.CHANNELS:
+                hdrs.append(f"raw_{ch}")
+        for ch in MultiChannelExtractor.CHANNELS:
+            hdrs.append(ch if not self._has_merged else f"merged_{ch}")
         with open(path, 'w', newline='', encoding='utf-8') as f:
             w = csv.writer(f); w.writerow(hdrs)
             for i in range(len(gd)):
                 row = [i]
                 if dm is not None: row.append(round(float(dm[i]),4))
                 row.append(int(bid[i]))
+                if self._has_merged and self.raw_profiles:
+                    for ch in MultiChannelExtractor.CHANNELS:
+                        raw_data = self.raw_profiles.get(ch, np.array([]))
+                        row.append(round(float(raw_data[i]), 4) if i < len(raw_data) else "")
                 for ch in MultiChannelExtractor.CHANNELS:
                     row.append(round(float(src[ch][i]),4))
                 w.writerow(row)
-        self.sb.showMessage(f"CSV exported: {os.path.basename(path)} ({len(gd)} rows)")
+        extra = " (raw + merged)" if self._has_merged else ""
+        self.sb.showMessage(f"CSV exported{extra}: {os.path.basename(path)} ({len(gd)} rows)")
 
     # ── Export plots ──────────────────────────
 
