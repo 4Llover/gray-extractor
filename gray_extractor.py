@@ -434,8 +434,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.image_bgr = None; self.boxes = []; self.profiles = {}; self.segments = []
         self.current_path = ""; self.calibrator = DepthCalibrator()
         self.illum_corrected = False; self.trend_lines = {}; self.red_mask = None
+        self.inner_boxes = []  # inner ROI after border trim (for visualization)
 
-        self.setWindowTitle("Gray Extractor v7.0")
+        self.setWindowTitle("Gray Extractor v7.2")
         self.setMinimumSize(1200, 750); self.resize(1600, 900)
         self._setup_ui(); self._setup_toolbar(); self._setup_statusbar()
         self.setAcceptDrops(True); self._apply_style()
@@ -622,6 +623,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._draw_boxes_on(display, groups)
 
             oh = sum(b[3] for b in self.boxes)
+            self.inner_boxes = [MultiChannelExtractor.inner_roi(self.red_mask, b) for b in self.boxes]
             self.profiles, self.segments = MultiChannelExtractor.extract_all(self.image_bgr, self.boxes, self.red_mask)
             ih = sum(s[1]-s[0] for s in self.segments) if self.segments else 0
             tp = oh-ih
@@ -638,16 +640,63 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_plot()
 
     def _draw_boxes_on(self, display, groups):
-        """Draw colored boxes, group arrows, and depth labels on the image."""
+        """Draw outer (red frame bounding rect) and inner (data region after border trim)
+        boundaries on the image, with cropped zone shown as a shaded overlay."""
         for gi, grp in enumerate(groups):
             cb = self._h2b(BOX_COLORS[gi % len(BOX_COLORS)])
+            # Lighter version of the group color for cropped-zone overlay
+            cb_light = tuple(min(255, c + 80) for c in cb)
             for pos, bi in enumerate(grp):
+                # ── Outer box: bounding rect of the red frame (thick line) ──
                 x, y, w, h = self.boxes[bi]
                 cv2.rectangle(display, (x, y), (x+w, y+h), cb, 3)
+
+                # ── Inner box: data region after border trim (dashed thin line) ──
+                if self.inner_boxes and bi < len(self.inner_boxes):
+                    ix, iy, iw, ih = self.inner_boxes[bi]
+                    # Draw inner rectangle with dashed lines
+                    dash_len = 8
+                    for _y in range(iy, iy+ih, dash_len*2):
+                        y1 = _y; y2 = min(_y + dash_len, iy+ih)
+                        cv2.line(display, (ix, y1), (ix, y2), cb_light, 1)       # left
+                        cv2.line(display, (ix+iw, y1), (ix+iw, y2), cb_light, 1)  # right
+                    for _x in range(ix, ix+iw, dash_len*2):
+                        x1 = _x; x2 = min(_x + dash_len, ix+iw)
+                        cv2.line(display, (x1, iy), (x2, iy), cb_light, 1)        # top
+                        cv2.line(display, (x1, iy+ih), (x2, iy+ih), cb_light, 1)  # bottom
+
+                    # ── Cropped zone overlay (semi-transparent shading) ──
+                    overlay = display.copy()
+                    # Top strip: y..iy
+                    if iy > y:
+                        cv2.rectangle(overlay, (x, y), (x+w, iy), cb_light, -1)
+                    # Bottom strip: iy+ih..y+h
+                    if iy+ih < y+h:
+                        cv2.rectangle(overlay, (x, iy+ih), (x+w, y+h), cb_light, -1)
+                    # Left strip: x..ix
+                    if ix > x:
+                        cv2.rectangle(overlay, (x, iy), (ix, iy+ih), cb_light, -1)
+                    # Right strip: ix+iw..x+w
+                    if ix+iw < x+w:
+                        cv2.rectangle(overlay, (ix+iw, iy), (x+w, iy+ih), cb_light, -1)
+                    display = cv2.addWeighted(display, 0.70, overlay, 0.30, 0)
+
+                # ── Label ──
                 lbl = f"G{gi+1}#{pos+1}" if len(grp)>1 else f"#{bi+1}"
                 (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)
                 cv2.rectangle(display, (x, y-lh-10), (x+lw+6, y), cb, -1)
                 cv2.putText(display, lbl, (x+3, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
+
+        # Legend
+        cv2.rectangle(display, (12, 12), (290, 62), (255,255,255), -1)
+        cv2.rectangle(display, (12, 12), (290, 62), (180,180,180), 1)
+        cv2.line(display, (20, 28), (60, 28), (100,100,100), 3)
+        cv2.putText(display, "Outer (red frame)", (68, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80,80,80), 1)
+
+        # Dashed line for inner
+        for _x in range(20, 50, 12):
+            cv2.line(display, (_x, 48), (_x+6, 48), (120,160,200), 1)
+        cv2.putText(display, "Inner (data region)", (68, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80,80,80), 1)
 
         # Arrows between consecutive groups
         for gi in range(len(groups)-1):
@@ -871,6 +920,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_order_changed(self):
         self.boxes = self.box_list.get_boxes()
         if self.image_bgr is not None and self.boxes:
+            self.inner_boxes = [MultiChannelExtractor.inner_roi(
+                getattr(self, 'red_mask', None), b) for b in self.boxes]
             self.profiles, self.segments = MultiChannelExtractor.extract_all(
                 self.image_bgr, self.boxes, getattr(self, 'red_mask', None))
             self._update_depth_bar()   # refresh group dropdown after reorder
@@ -887,13 +938,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Export CSV ────────────────────────────
 
     def _export_csv(self):
-        src = self.profiles
-        if self.illum_corrected:
-            src = {}
-            for ch in MultiChannelExtractor.CHANNELS:
-                if ch in self.profiles and len(self.profiles[ch])>0:
-                    src[ch], _ = IlluminationCorrector.correct(self.profiles[ch])
-        gd = src.get("gray", np.array([]))
+        gd = self.profiles.get("gray", np.array([]))
         if len(gd)==0: return
         dn = "gray_profile.csv"
         if self.current_path:
@@ -909,22 +954,37 @@ class MainWindow(QtWidgets.QMainWindow):
         # Depth column
         dm = self._build_depth_array()
 
+        # Compute illumination-corrected values (always)
+        corrected = {}
+        for ch in MultiChannelExtractor.CHANNELS:
+            if ch in self.profiles and len(self.profiles[ch]) > 0:
+                corrected[ch], _ = IlluminationCorrector.correct(self.profiles[ch])
+
+        # Build headers: row_px, depth_m, box_id, [raw channels], [corrected channels]
         hdrs = ["row_px"]
         if dm is not None: hdrs.append("depth_m")
         hdrs.append("box_id")
-        hdrs.extend(MultiChannelExtractor.CHANNELS)
+        for ch in MultiChannelExtractor.CHANNELS:
+            hdrs.append(ch)
+        for ch in MultiChannelExtractor.CHANNELS:
+            hdrs.append(f"{ch}_corr")
 
+        n = len(gd)
         with open(path, 'w', newline='', encoding='utf-8') as f:
             w = csv.writer(f); w.writerow(hdrs)
-            for i in range(len(gd)):
+            for i in range(n):
                 row = [i]
                 if dm is not None: row.append(round(float(dm[i]), 4))
                 row.append(int(bid[i]))
+                # Raw values
                 for ch in MultiChannelExtractor.CHANNELS:
-                    row.append(round(float(src[ch][i]), 4))
+                    row.append(round(float(self.profiles[ch][i]), 4))
+                # Corrected values
+                for ch in MultiChannelExtractor.CHANNELS:
+                    row.append(round(float(corrected[ch][i]), 4))
                 w.writerow(row)
 
-        self.sb.showMessage(f"CSV exported: {os.path.basename(path)} ({len(gd)} rows)")
+        self.sb.showMessage(f"CSV exported: {os.path.basename(path)} ({n} rows, 6 raw + 6 corrected channels)")
 
     # ── Export plots ──────────────────────────
 
