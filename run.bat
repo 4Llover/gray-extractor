@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 echo ================================
-echo Gray Extractor v6.0
+echo Gray Extractor v7.0
 echo ================================
 echo Activating conda qt6...
 call "E:\anaconda3\condabin\conda.bat" activate qt6
