@@ -23,29 +23,45 @@ class MultiChannelExtractor:
     CHANNELS = ["gray", "redness", "greenness", "blueness", "L_star", "a_star"]
 
     @staticmethod
-    def inner_roi(red_mask, outer_rect, min_frac=0.15, max_scan=20):
+    def inner_roi(red_mask, outer_rect, min_frac=0.05, max_scan=50):
+        """Scan inward from each edge using FULL row/column to find
+        where the red border ends. Designed for thick (>8px), straight borders.
+
+        For each edge, scans inward until <5% of the row/column is red.
+        Proportional fallback: max(4, w/30) px when can't detect border.
+        """
         x, y, w, h = outer_rect
         roi = red_mask[y:y+h, x:x+w]
-        ca, cb = w//4, 3*w//4; ra, rb = h//4, 3*h//4
-        def _scan(d, limit):
+
+        def _scan(direction, limit):
             n = limit
             for i in range(limit):
-                if d == 'top':    strip = roi[i, ca:cb]
-                elif d == 'bot':  strip = roi[h-1-i, ca:cb]
-                elif d == 'left': strip = roi[ra:rb, i]
-                else:             strip = roi[ra:rb, w-1-i]
-                if np.count_nonzero(strip)/max(len(strip),1) < min_frac:
+                if direction == 'top':
+                    frac = np.count_nonzero(roi[i, :]) / max(w, 1)
+                elif direction == 'bottom':
+                    frac = np.count_nonzero(roi[h-1-i, :]) / max(w, 1)
+                elif direction == 'left':
+                    frac = np.count_nonzero(roi[:, i]) / max(h, 1)
+                else:  # 'right'
+                    frac = np.count_nonzero(roi[:, w-1-i]) / max(h, 1)
+                if frac < min_frac:
                     n = i; break
             return n
-        ti = _scan('top', max_scan); bi = _scan('bot', max_scan)
-        li = _scan('left', max_scan); ri = _scan('right', max_scan)
-        if ti >= max_scan: ti = 3
-        if bi >= max_scan: bi = 3
-        if li >= max_scan: li = 3
-        if ri >= max_scan: ri = 3
-        ix, iy = x+li, y+ti
-        iw = (w-ri)-li; ih = (h-bi)-ti
-        if iw<10 or ih<20: return outer_rect
+
+        ti = _scan('top', max_scan);   bi = _scan('bottom', max_scan)
+        li = _scan('left', max_scan);  ri = _scan('right', max_scan)
+
+        # Proportional fallback
+        fb_h = max(4, h // 40)
+        fb_w = max(4, w // 30)
+        if ti >= max_scan: ti = fb_h
+        if bi >= max_scan: bi = fb_h
+        if li >= max_scan: li = fb_w
+        if ri >= max_scan: ri = fb_w
+
+        ix, iy = x + li, y + ti
+        iw = (w - ri) - li; ih = (h - bi) - ti
+        if iw < 10 or ih < 20: return outer_rect
         return (ix, iy, iw, ih)
 
     @staticmethod
@@ -127,21 +143,33 @@ class IlluminationCorrector:
 
 
 class DepthCalibrator:
+    """Per-group depth calibration. Each box group (strata segment)
+    gets its own top/bottom depth in meters. When multiple groups are
+    calibrated, overlapping depth ranges are averaged."""
     def __init__(self):
-        self.top_px = self.bottom_px = None
-        self.top_m = self.bottom_m = None
+        self.group_depth = {}   # {group_idx: (top_m, bottom_m)}
         self.is_calibrated = False
 
-    def set_points(self, top_px, bottom_px, top_m, bottom_m):
-        self.top_px = top_px; self.bottom_px = bottom_px
-        self.top_m = top_m; self.bottom_m = bottom_m
-        self.is_calibrated = True
+    def set_group(self, group_idx, top_m, bottom_m):
+        self.group_depth[group_idx] = (top_m, bottom_m)
+        self.is_calibrated = bool(self.group_depth)
 
-    def pixel_to_depth(self, y):
-        if not self.is_calibrated: return np.asarray(y, dtype=np.float32)
-        y = np.asarray(y, dtype=np.float64)
-        frac = (y - self.top_px) / (self.bottom_px - self.top_px)
-        return (self.top_m + frac * (self.bottom_m - self.top_m)).astype(np.float32)
+    def remove_group(self, group_idx):
+        self.group_depth.pop(group_idx, None)
+        self.is_calibrated = bool(self.group_depth)
+
+    def get_group(self, group_idx):
+        return self.group_depth.get(group_idx)
+
+    def pixel_to_depth(self, local_row, group_height, group_idx):
+        """Convert local pixel row (0..group_height) to depth for a specific group.
+        Returns float or array."""
+        if not self.is_calibrated or group_idx not in self.group_depth:
+            return np.asarray(local_row, dtype=np.float32)
+        top_m, bottom_m = self.group_depth[group_idx]
+        y = np.asarray(local_row, dtype=np.float64)
+        frac = y / max(group_height, 1)
+        return (top_m + frac * (bottom_m - top_m)).astype(np.float32)
 
     def clear(self): self.__init__()
 
@@ -195,8 +223,8 @@ class MultiChannelPlotWidget(FigureCanvasQTAgg):
         for i, ch in enumerate(MultiChannelExtractor.CHANNELS):
             self.axes[ch] = self.figure.add_subplot(2, 3, i+1)
 
-    def plot(self, profiles, segments, calibrator=None, illum_corrected=False, trend_lines=None):
-        self._depth_data = (profiles, segments, calibrator, illum_corrected, trend_lines)
+    def plot(self, profiles, segments, depth_array=None, illum_corrected=False, trend_lines=None):
+        self._depth_data = (profiles, segments, depth_array, illum_corrected, trend_lines)
         for ch in MultiChannelExtractor.CHANNELS:
             ax = self.axes[ch]; ax.clear()
             data = profiles.get(ch)
@@ -217,24 +245,22 @@ class MultiChannelPlotWidget(FigureCanvasQTAgg):
             ax.set_title(ch, fontsize=9, fontweight='bold', color=color)
             ax.grid(True, alpha=0.2, linestyle='--'); ax.tick_params(labelsize=7)
 
-            # ── v5: Depth ruler ──
-            if calibrator and calibrator.is_calibrated:
-                # Add depth ticks: show ~10 evenly spaced depth markers
-                n_ticks = 10
+            # ── v5.1: Per-group depth ruler ──
+            if depth_array is not None and len(depth_array) == n:
+                n_ticks = 8
                 step = max(1, n // n_ticks)
                 tick_rows = list(range(0, n, step))
-                tick_depths = calibrator.pixel_to_depth(np.array(tick_rows, dtype=float))
-                # Set y-tick labels to depth values on the LEFT axis
+                tick_labels = [f"{depth_array[i]:.2f}" for i in tick_rows]
                 ax.set_yticks(tick_rows)
-                ax.set_yticklabels([f"{d:.2f}" for d in tick_depths], fontsize=6)
+                ax.set_yticklabels(tick_labels, fontsize=6)
                 ax.set_ylabel("Depth (m)", fontsize=7)
-                # Add horizontal ruler lines at segment boundaries
+                # Segment boundary markers
                 for ss, se, bi in segments:
                     if ss > 0:
-                        d_ss = calibrator.pixel_to_depth(np.array([ss], dtype=float))[0]
                         ax.axhline(ss, color='#F0B429', linestyle='-', linewidth=1.0, alpha=0.5)
-                        ax.text(0.02, ss/n, f'{d_ss:.2f}m', transform=ax.transAxes,
-                                fontsize=6, color='#F0B429', va='center', clip_on=False)
+                        ax.text(0.02, ss/n, f'{depth_array[min(ss,n-1)]:.2f}m',
+                                transform=ax.transAxes, fontsize=6, color='#F0B429',
+                                va='center', clip_on=False)
 
         self.figure.tight_layout(pad=2.0)
         self.draw()
@@ -365,26 +391,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.image_view.setMinimumWidth(450)
         left.addWidget(self.image_view, 1)
 
-        # Quick depth bar below image
+        # Quick depth bar below image — per-group calibration
         depth_bar = QtWidgets.QHBoxLayout()
-        depth_bar.addWidget(QtWidgets.QLabel("Top depth:"))
+        depth_bar.addWidget(QtWidgets.QLabel("Group:"))
+        self.combo_group = QtWidgets.QComboBox()
+        self.combo_group.setMinimumWidth(120)
+        self.combo_group.currentIndexChanged.connect(self._on_group_selected)
+        depth_bar.addWidget(self.combo_group)
+
+        depth_bar.addWidget(QtWidgets.QLabel("  Top:"))
         self.spin_top_m = QtWidgets.QDoubleSpinBox()
-        self.spin_top_m.setDecimals(3); self.spin_top_m.setRange(0,1000)
-        self.spin_top_m.setSuffix(" m"); self.spin_top_m.setMinimumWidth(100)
-        self.spin_top_m.valueChanged.connect(self._on_depth_changed)
+        self.spin_top_m.setDecimals(3); self.spin_top_m.setRange(-10, 1000)
+        self.spin_top_m.setSuffix(" m"); self.spin_top_m.setMinimumWidth(90)
         depth_bar.addWidget(self.spin_top_m)
 
-        depth_bar.addWidget(QtWidgets.QLabel("  Bottom depth:"))
+        depth_bar.addWidget(QtWidgets.QLabel("  Bottom:"))
         self.spin_bot_m = QtWidgets.QDoubleSpinBox()
-        self.spin_bot_m.setDecimals(3); self.spin_bot_m.setRange(0,1000)
-        self.spin_bot_m.setSuffix(" m"); self.spin_bot_m.setMinimumWidth(100)
-        self.spin_bot_m.valueChanged.connect(self._on_depth_changed)
+        self.spin_bot_m.setDecimals(3); self.spin_bot_m.setRange(-10, 1000)
+        self.spin_bot_m.setSuffix(" m"); self.spin_bot_m.setMinimumWidth(90)
         depth_bar.addWidget(self.spin_bot_m)
 
-        self.btn_calib = QtWidgets.QPushButton("Set Depth")
+        self.btn_calib = QtWidgets.QPushButton("Set")
         self.btn_calib.clicked.connect(self._apply_depth)
         self.btn_calib.setEnabled(False)
-        self.btn_calib.setStyleSheet("padding:2px 10px; background:#1A9C6E; color:white; border-radius:3px;")
+        self.btn_calib.setStyleSheet("padding:2px 8px; background:#1A9C6E; color:white; border-radius:3px;")
         depth_bar.addWidget(self.btn_calib)
         depth_bar.addStretch()
         left.addLayout(depth_bar)
@@ -477,6 +507,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_illum.setEnabled(has); self.act_csv.setEnabled(has); self.act_plots.setEnabled(has)
         self.btn_calib.setEnabled(has)
         self.illum_corrected = False; self.act_illum.setChecked(False); self.trend_lines = {}
+        if has:
+            self._update_depth_bar()
 
         display = self.image_bgr.copy()
         if not self.boxes:
@@ -500,10 +532,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 x1,y1,w1,h1 = self.boxes[lb]; x2,y2,w2,h2 = self.boxes[fb]
                 cv2.arrowedLine(display, (x1+w1//2,y1+h1), (x2+w2//2,y2), (80,80,80), 2, tipLength=0.04)
             if self.calibrator.is_calibrated:
-                for pv, lb in [(self.calibrator.top_px,"Top"), (self.calibrator.bottom_px,"Bottom")]:
-                    if 0<=pv<=display.shape[0]:
-                        cv2.line(display, (0,int(pv)), (display.shape[1],int(pv)), (255,165,0), 2)
-                        cv2.putText(display, f"{lb}", (10,int(pv)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,140,0), 2)
+                for gi in range(len(groups)):
+                    d = self.calibrator.get_group(gi)
+                    if d:
+                        # Show group label on image
+                        grp_boxes = groups[gi]
+                        rep_box = self.boxes[grp_boxes[0]]
+                        xb, yb = rep_box[0] - 30, rep_box[1] + rep_box[3] // 2
+                        cv2.putText(display, f"G{gi+1}: {d[0]:.1f}–{d[1]:.1f}m",
+                                    (max(5, xb), yb),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 140, 0), 2)
 
             oh = sum(b[3] for b in self.boxes)
             self.profiles, self.segments = MultiChannelExtractor.extract_all(self.image_bgr, self.boxes, self.red_mask)
@@ -516,7 +554,13 @@ class MainWindow(QtWidgets.QMainWindow):
             info += f"Border trimmed: {tp} px total\n"
             info += "─"*35+"\n"
             if self.calibrator.is_calibrated:
-                info += f"Depth: {self.calibrator.top_m:.3f} – {self.calibrator.bottom_m:.3f} m\n"
+                cal_info = []
+                for gi in range(len(groups)):
+                    d = self.calibrator.get_group(gi)
+                    if d:
+                        cal_info.append(f"  G{gi+1}: {d[0]:.3f} – {d[1]:.3f} m")
+                if cal_info:
+                    info += "\n".join(cal_info) + "\n"
             for gi, grp in enumerate(groups):
                 if len(grp)==1:
                     x,y,w,h = self.boxes[grp[0]]
@@ -543,28 +587,75 @@ class MainWindow(QtWidgets.QMainWindow):
                 if ch in self.profiles and len(self.profiles[ch])>0:
                     profiles_to_plot[ch], trend[ch] = IlluminationCorrector.correct(self.profiles[ch])
             self.trend_lines = trend
-        cal = self.calibrator if self.calibrator.is_calibrated else None
-        self.plot_widget.plot(profiles_to_plot, self.segments, cal,
+        # Build per-group depth array
+        depth_arr = None
+        if self.calibrator.is_calibrated and self.segments:
+            n = len(self.profiles.get("gray", []))
+            depth_arr = np.zeros(n, dtype=np.float32)
+            groups = MultiChannelExtractor.group_boxes(self.boxes)
+            # Map box→group
+            box2group = {}
+            for gi, grp in enumerate(groups):
+                for bi in grp:
+                    box2group[bi] = gi
+            for ss, se, bi in self.segments:
+                gi = box2group.get(bi, 0)
+                h = se - ss
+                local = np.arange(h, dtype=np.float64)
+                depth_arr[ss:se] = self.calibrator.pixel_to_depth(local, h, gi)
+        self.plot_widget.plot(profiles_to_plot, self.segments, depth_arr,
                               illum_corrected=self.illum_corrected, trend_lines=self.trend_lines)
 
     # ── Depth calibration ────────────────────
 
+    def _update_depth_bar(self):
+        """Populate group dropdown and show current depth for selected group."""
+        groups = MultiChannelExtractor.group_boxes(self.boxes)
+        self.combo_group.blockSignals(True)
+        self.combo_group.clear()
+        for gi, grp in enumerate(groups):
+            labels = ','.join(str(b+1) for b in grp)
+            self.combo_group.addItem(f"Group {gi+1} (Box {labels})")
+        self.combo_group.blockSignals(False)
+        self._on_group_selected(0)
+
+    def _on_group_selected(self, idx):
+        if idx < 0: return
+        d = self.calibrator.get_group(idx)
+        self.spin_top_m.blockSignals(True)
+        self.spin_bot_m.blockSignals(True)
+        if d:
+            self.spin_top_m.setValue(d[0]); self.spin_bot_m.setValue(d[1])
+        else:
+            self.spin_top_m.setValue(0); self.spin_bot_m.setValue(1)
+        self.spin_top_m.blockSignals(False)
+        self.spin_bot_m.blockSignals(False)
+
     def _apply_depth(self):
         if not self.boxes: return
+        gi = self.combo_group.currentIndex()
+        if gi < 0: return
         tm = self.spin_top_m.value(); bm = self.spin_bot_m.value()
         if tm >= bm:
-            QtWidgets.QMessageBox.warning(self, "Depth", "Top depth must be < bottom depth")
+            QtWidgets.QMessageBox.warning(self, "Depth", "Top must be < bottom depth")
             return
-        # Use the full profile height as pixel range
-        n = len(self.profiles.get("gray", []))
-        top_px = 0; bottom_px = float(n)
-        self.calibrator.set_points(top_px, bottom_px, tm, bm)
-        self._detect_and_extract()
-        self.sb.showMessage(f"Depth set: {tm:.2f} – {bm:.2f} m ({abs(bm-tm):.2f}m over {n} px)")
-
-    def _on_depth_changed(self):
-        if self.calibrator.is_calibrated and self.boxes:
-            self._apply_depth()
+        self.calibrator.set_group(gi, tm, bm)
+        self._refresh_plot()
+        groups = MultiChannelExtractor.group_boxes(self.boxes)
+        info = f"Group {gi+1} depth: {tm:.3f} – {bm:.3f} m"
+        all_cal = [g for g in range(len(groups)) if self.calibrator.get_group(g)]
+        if len(all_cal) > 1:
+            # Cross-group alignment: merge overlapping depth ranges
+            merged = []
+            for g in sorted(all_cal):
+                d = self.calibrator.get_group(g)
+                merged.append((g, d[0], d[1]))
+            merged.sort(key=lambda x: x[1])
+            for a, b in zip(merged, merged[1:]):
+                if a[2] > b[1]:
+                    overlap = a[2] - b[1]
+                    info += f"\n⚠ Group {a[0]+1} & {b[0]+1} overlap {overlap:.3f}m"
+        self.sb.showMessage(info)
 
     # ── Illumination toggle ──────────────────
 
@@ -619,8 +710,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path: return
         bid = np.full(len(gd), -1, dtype=int)
         for ss, se, bi in self.segments: bid[ss:se] = bi+1
-        rows = np.arange(len(gd), dtype=np.float64)
-        dm = self.calibrator.pixel_to_depth(rows) if self.calibrator.is_calibrated else None
+        # Per-group depth
+        dm = None
+        if self.calibrator.is_calibrated:
+            dm = np.zeros(len(gd), dtype=np.float32)
+            groups = MultiChannelExtractor.group_boxes(self.boxes)
+            b2g = {}
+            for gi, grp in enumerate(groups):
+                for bi in grp: b2g[bi] = gi
+            for ss, se, bi in self.segments:
+                gi = b2g.get(bi, 0); h = se-ss
+                local = np.arange(h, dtype=np.float64)
+                dm[ss:se] = self.calibrator.pixel_to_depth(local, h, gi)
         hdrs = ["row_px"]; hdrs += (["depth_m"] if dm is not None else [])
         hdrs += ["box_id"] + MultiChannelExtractor.CHANNELS
         with open(path, 'w', newline='', encoding='utf-8') as f:
