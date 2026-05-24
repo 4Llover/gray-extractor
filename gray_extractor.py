@@ -868,8 +868,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._refresh_plot()
         self._redraw_image()
+        self._update_info_table()
 
-        info = f"Group {gi+1}: {tm:.3f} – {bm:.3f} m"
+        info = f"Group {gi+1}: {tm:.3f} - {bm:.3f} m"
         if warnings:
             info += "\n⚠ " + "\n⚠ ".join(warnings)
         self.sb.showMessage(info)
