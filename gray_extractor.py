@@ -174,6 +174,16 @@ class DepthCalibrator:
 
 
 class RedBoxDetector:
+    """Detect red rectangular bounding boxes in HSV space.
+
+    Boxes are sorted by bottom-Y descending (i.e. stratigraphic order:
+    highest in photo = deepest stratigraphically = last in list).
+    This works because outcrop photos are shot top-down: the top of
+    the photo is the shallowest stratigraphic level. Users who draw
+    boxes out of order don't need to worry — extract_all processes
+    boxes in this sorted order, and group_boxes further handles
+    parallel (side-by-side) boxes via center-distance clustering.
+    """
     @staticmethod
     def detect_all(image_bgr):
         hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
@@ -476,12 +486,33 @@ class MainWindow(QtWidgets.QMainWindow):
             "padding:2px 8px; background:#ccc; color:#333; border-radius:3px;")
         depth_bar.addWidget(self.btn_clear_depth)
 
+        self.btn_reset_all = QtWidgets.QPushButton("Reset All")
+        self.btn_reset_all.clicked.connect(self._reset_all_depths)
+        self.btn_reset_all.setEnabled(False)
+        self.btn_reset_all.setStyleSheet(
+            "padding:2px 8px; background:#E74C3C; color:white; border-radius:3px;")
+        depth_bar.addWidget(self.btn_reset_all)
+
         depth_bar.addStretch()
         left.addLayout(depth_bar)
 
-        self.info_label = QtWidgets.QLabel("")
-        self.info_label.setStyleSheet("color:#555;font-size:11px;padding:2px;")
-        left.addWidget(self.info_label)
+        # Info table — replaces old info_label
+        self.info_table = QtWidgets.QTableWidget()
+        self.info_table.setColumnCount(4)
+        self.info_table.setHorizontalHeaderLabels(["Group", "Depth", "Position", "Size"])
+        self.info_table.horizontalHeader().setStretchLastSection(True)
+        self.info_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.info_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.info_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.info_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.info_table.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.info_table.setAlternatingRowColors(True)
+        self.info_table.setMaximumHeight(160)
+        self.info_table.setStyleSheet(
+            "QTableWidget{font-size:10px;border:1px solid #ddd;gridline-color:#eee;}"
+            "QTableWidget::item{padding:1px 4px;}"
+            "QHeaderView::section{background:#f0f0f0;font-weight:bold;font-size:10px;padding:2px;}")
+        left.addWidget(self.info_table)
 
         # ── Right: plot + box list ──
         right = QtWidgets.QVBoxLayout()
@@ -575,6 +606,7 @@ class MainWindow(QtWidgets.QMainWindow):
         has = bool(self.boxes)
         self.act_illum.setEnabled(has); self.act_csv.setEnabled(has); self.act_plots.setEnabled(has)
         self.btn_calib.setEnabled(has); self.btn_clear_depth.setEnabled(False)
+        self.btn_reset_all.setEnabled(False)
         self.illum_corrected = False; self.act_illum.setChecked(False); self.trend_lines = {}
         if has:
             self._update_depth_bar()
@@ -584,7 +616,7 @@ class MainWindow(QtWidgets.QMainWindow):
             cv2.putText(display, "X No red boxes found!", (40,60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
             self.profiles = {ch: np.array([]) for ch in MultiChannelExtractor.CHANNELS}
             self.segments = []; self.box_list.set_boxes([])
-            self.info_label.setText("No red boxes found."); self.sb.showMessage("No red boxes")
+            self.info_table.setRowCount(0); self.sb.showMessage("No red boxes")
         else:
             groups = MultiChannelExtractor.group_boxes(self.boxes)
             self._draw_boxes_on(display, groups)
@@ -596,26 +628,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.box_list.set_boxes(self.boxes, groups)
             gray = self.profiles.get("gray", np.array([]))
             n = len(gray)
-
-            # Info text
-            info = f"Boxes: {len(self.boxes)} → {len(groups)} group(s) → {n} rows\n"
-            info += f"Border trimmed: {tp} px total\n"
-            info += "─"*35+"\n"
-            if self.calibrator.is_calibrated:
-                for gi in range(len(groups)):
-                    d = self.calibrator.get_group(gi)
-                    if d:
-                        info += f"  G{gi+1}: {d[0]:.3f} – {d[1]:.3f} m\n"
-            for gi, grp in enumerate(groups):
-                if len(grp)==1:
-                    x,y,w,h = self.boxes[grp[0]]
-                    info += f"  G{gi+1}: ({x},{y}) {w}×{h}  |  pixel res: {h/n:.1f}px\n" if n>0 else f"  G{gi+1}: ({x},{y}) {w}×{h}\n"
-                else:
-                    info += f"  G{gi+1}: {len(grp)} parallel → averaged\n"
-                    for pos, bi in enumerate(grp):
-                        x,y,w,h = self.boxes[bi]
-                        info += f"    #{bi+1}: ({x},{y}) {w}×{h}\n"
-            self.info_label.setText(info)
+            self._update_info_table(groups, n, tp)
             self.sb.showMessage(f"{len(groups)} group(s) | {n} rows | 6 channels")
 
         display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
@@ -679,6 +692,67 @@ class MainWindow(QtWidgets.QMainWindow):
             depth_arr[ss:se] = self.calibrator.pixel_to_depth(local, h, gi)
         return depth_arr
 
+    def _update_info_table(self, groups=None, n_rows=0, trimmed=0):
+        """Populate the info table with group details.
+        Call with no args to just refresh from current state."""
+        if groups is None:
+            if not self.boxes: return
+            groups = MultiChannelExtractor.group_boxes(self.boxes)
+        if self.profiles:
+            gray = self.profiles.get("gray", np.array([]))
+            if n_rows == 0:
+                n_rows = len(gray)
+
+        self.info_table.setRowCount(0)
+        for gi, grp in enumerate(groups):
+            row = self.info_table.rowCount(); self.info_table.insertRow(row)
+            # Col 0: Group name
+            if len(grp) == 1:
+                gname = f"G{gi+1}"
+            else:
+                gname = f"G{gi+1} ({len(grp)} parallel)"
+            self.info_table.setItem(row, 0, QtWidgets.QTableWidgetItem(gname))
+            # Col 1: Depth
+            d = self.calibrator.get_group(gi)
+            if d:
+                depth_str = f"{d[0]:.3f} – {d[1]:.3f} m"
+            else:
+                depth_str = "—"
+            item = QtWidgets.QTableWidgetItem(depth_str)
+            item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.info_table.setItem(row, 1, item)
+            # Col 2: Position
+            if len(grp) == 1:
+                x, y, w, h = self.boxes[grp[0]]
+                pos_str = f"({x}, {y})"
+            else:
+                pos_str = f"{len(grp)} boxes"
+            item = QtWidgets.QTableWidgetItem(pos_str)
+            item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.info_table.setItem(row, 2, item)
+            # Col 3: Size
+            if len(grp) == 1:
+                x, y, w, h = self.boxes[grp[0]]
+                size_str = f"{w}×{h}"
+            else:
+                max_h = max(self.boxes[bi][3] for bi in grp)
+                size_str = f"avg → {max_h}"
+            item = QtWidgets.QTableWidgetItem(size_str)
+            item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.info_table.setItem(row, 3, item)
+
+        # Summary row
+        row = self.info_table.rowCount(); self.info_table.insertRow(row)
+        summary = f"{len(self.boxes)} boxes, {len(groups)} groups, {n_rows} rows"
+        if trimmed:
+            summary += f"  (trimmed: {trimmed} px)"
+        item = QtWidgets.QTableWidgetItem(summary)
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        font = item.font(); font.setItalic(True); item.setFont(font)
+        item.setForeground(QtGui.QColor("#888"))
+        self.info_table.setItem(row, 0, item)
+        self.info_table.setSpan(row, 0, 1, 4)
+
     def _refresh_plot(self):
         profiles_to_plot = self.profiles.copy(); trend = {}
         if self.illum_corrected and self.profiles:
@@ -728,6 +802,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.calibrator.set_group(gi, tm, bm)
         self.btn_clear_depth.setEnabled(True)
+        self.btn_reset_all.setEnabled(True)
 
         # ── Warn if adjacent groups have depth gaps ──
         groups = MultiChannelExtractor.group_boxes(self.boxes)
@@ -756,10 +831,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if gi < 0: return
         self.calibrator.remove_group(gi)
         self.btn_clear_depth.setEnabled(False)
+        # Update Reset All state
+        has_any = any(self.calibrator.get_group(g) for g in range(
+            len(MultiChannelExtractor.group_boxes(self.boxes))))
+        self.btn_reset_all.setEnabled(has_any)
         self.spin_top_m.setValue(0); self.spin_bot_m.setValue(1)
         self._refresh_plot()
         self._redraw_image()
         self.sb.showMessage(f"Depth cleared for Group {gi+1}")
+
+    def _reset_all_depths(self):
+        """Clear ALL group depth calibrations at once."""
+        if not self.calibrator.is_calibrated: return
+        n_groups = len(MultiChannelExtractor.group_boxes(self.boxes))
+        self.calibrator.clear()
+        self.btn_clear_depth.setEnabled(False)
+        self.btn_reset_all.setEnabled(False)
+        self.spin_top_m.setValue(0); self.spin_bot_m.setValue(1)
+        self._refresh_plot()
+        self._redraw_image()
+        self._update_info_table()
+        self.sb.showMessage(f"All {n_groups} group depth calibrations cleared")
 
     # ── Illumination toggle ──────────────────
 
@@ -781,6 +873,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.image_bgr is not None and self.boxes:
             self.profiles, self.segments = MultiChannelExtractor.extract_all(
                 self.image_bgr, self.boxes, getattr(self, 'red_mask', None))
+            self._update_depth_bar()   # refresh group dropdown after reorder
             self._refresh_plot()
             display = self.image_bgr.copy()
             groups = MultiChannelExtractor.group_boxes(self.boxes)
