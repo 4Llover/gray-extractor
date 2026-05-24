@@ -1,13 +1,14 @@
 """
-Gray Extractor v5.0 — Zoomable Image + Depth Ruler + Plot Export
-================================================================
-New in v5.0:
-  - QGraphicsView-based zoomable/pannable image viewer
-  - Simplified depth calibration (toolbar spinboxes)
-  - Depth ruler on profile plots with key marker lines
-  - Export 6-channel plots as PNG/SVG/PDF
-  - Depth-aware overlap verification
-  - All v4.0 features retained
+Gray Extractor v6.0 — Multi-View Layout + Depth-Grid Overlap Merge
+==================================================================
+New in v6.0:
+  - True view switching: All 6 / Gray+L*a* / Gray only
+    Each view has its own layout — not just hiding subplots.
+  - Completely rewritten OverlapMerger: depth-grid resampling
+    Fixes "crops a section downward" bug from v5.x.
+  - Auto-centering for all view modes.
+  - All v5.x features retained (zoomable image, per-group depth,
+    illumination correction, CSV/plot export).
 """
 import sys, os, csv
 import numpy as np, cv2
@@ -206,22 +207,43 @@ CHANNEL_LABELS = {"gray":"Gray (0–255)","redness":"R/(R+G+B)","greenness":"G/(
 
 
 # ═══════════════════════════════════════════════
-#  Multi-channel plot widget (v5.2: 1-column layout)
+#  Multi-channel plot widget (v6.0: true view switching)
 # ═══════════════════════════════════════════════
 
 class MultiChannelPlotWidget(FigureCanvasQTAgg):
-    """Asymmetric 3-column layout:
-       Left (wide): gray only
-       Middle (medium): L* + a* stacked
-       Right (narrow): redness, greenness, blueness stacked"""
+    """Three distinct view modes, each with its own layout:
 
-    LAYOUT = {
-        "gray":       (0, 0.40, 0.58),   # (left, width_ratio, height)
-        "L_star":     (0.42, 0.28, 0.47),
-        "a_star":     (0.42, 0.28, 0.47),
-        "redness":    (0.72, 0.26, 0.30),
-        "greenness":  (0.72, 0.26, 0.30),
-        "blueness":   (0.72, 0.26, 0.30),
+    Mode "all" — 3-column asymmetric:
+        Left (wide): gray only
+        Middle: L* + a* stacked
+        Right: redness, greenness, blueness stacked
+
+    Mode "gray_lab" — 2-column:
+        Left (wide): gray only
+        Right: L* (top), a* (bottom) stacked
+
+    Mode "gray" — 1 full-width centered:
+        Single gray plot, centered with generous margins
+    """
+
+    # Layout definitions: {channel: (left, width_ratio, bottom, height_ratio)}
+    LAYOUTS = {
+        "all": {
+            "gray":       (0.04, 0.35, 0.06, 0.90),
+            "L_star":     (0.43, 0.25, 0.53, 0.43),
+            "a_star":     (0.43, 0.25, 0.06, 0.43),
+            "redness":    (0.72, 0.25, 0.68, 0.28),
+            "greenness":  (0.72, 0.25, 0.37, 0.28),
+            "blueness":   (0.72, 0.25, 0.06, 0.28),
+        },
+        "gray_lab": {
+            "gray":       (0.06, 0.55, 0.06, 0.90),
+            "L_star":     (0.65, 0.30, 0.53, 0.43),
+            "a_star":     (0.65, 0.30, 0.06, 0.43),
+        },
+        "gray": {
+            "gray":       (0.12, 0.76, 0.08, 0.84),
+        },
     }
 
     def __init__(self, parent=None):
@@ -230,19 +252,34 @@ class MultiChannelPlotWidget(FigureCanvasQTAgg):
         super().__init__(self.figure)
         self.setParent(parent)
         self.axes = {}
+        self._view_mode = "all"
         self._create_subplots()
-        self._depth_data = None
+        self._plot_cache = None  # (profiles, segments, depth_array, illum_corrected, trend_lines)
 
     def _create_subplots(self):
-        # Left: gray (full height)
-        self.axes["gray"] = self.figure.add_axes((0.04, 0.06, 0.34, 0.90))
-        # Middle: L_star (top half), a_star (bottom half)
-        self.axes["L_star"] = self.figure.add_axes((0.42, 0.53, 0.24, 0.43))
-        self.axes["a_star"] = self.figure.add_axes((0.42, 0.06, 0.24, 0.43))
-        # Right: redness, greenness, blueness
-        self.axes["redness"]   = self.figure.add_axes((0.70, 0.68, 0.27, 0.28))
-        self.axes["greenness"] = self.figure.add_axes((0.70, 0.37, 0.27, 0.28))
-        self.axes["blueness"]  = self.figure.add_axes((0.70, 0.06, 0.27, 0.28))
+        """Clear and recreate all axes for the current view mode."""
+        # Remove all existing axes
+        for ax in list(self.axes.values()):
+            self.figure.delaxes(ax)
+        self.axes.clear()
+
+        layout = self.LAYOUTS[self._view_mode]
+        for ch, (left, width, bottom, height) in layout.items():
+            self.axes[ch] = self.figure.add_axes((left, bottom, width, height))
+
+    def set_view_mode(self, mode):
+        """Switch to a new view mode, recreating the layout.
+        Valid modes: 'all', 'gray_lab', 'gray'"""
+        if mode not in self.LAYOUTS:
+            return
+        if mode == self._view_mode and self.axes:
+            return  # already in this mode with axes created
+        self._view_mode = mode
+        self._create_subplots()
+        # Re-plot cached data if available
+        if self._plot_cache:
+            prof, seg, da, ic, tl = self._plot_cache
+            self._do_plot(prof, seg, da, ic, tl)
 
     def _draw_one(self, ax, ch, data, n, segments, depth_array, illum_corrected, trend_lines):
         color = CHANNEL_COLORS[ch]
@@ -255,31 +292,34 @@ class MultiChannelPlotWidget(FigureCanvasQTAgg):
             ax.plot(trend_lines[ch], y_vals, '--', color='#999', linewidth=0.7, alpha=0.7)
 
         ax.invert_yaxis()
-        # ── Title: inside top-left with colored background ──
-        is_wide = (ch == "gray")
-        fs = 7 if is_wide else 6
+
+        # Title badge — size depends on whether it's the solo gray view
+        is_solo = (self._view_mode == "gray")
+        fs = 9 if is_solo else (7 if ch == "gray" else 6)
         ax.text(0.03, 0.96, f" {ch} ", transform=ax.transAxes,
                 fontsize=fs, fontweight='bold', color='white',
                 va='top', ha='left',
                 bbox=dict(boxstyle='round,pad=0.25', facecolor=color, alpha=0.85, edgecolor='none'))
-        # ── X-label: inside bottom-right ──
+
+        # X-label
         ax.text(0.97, 0.03, CHANNEL_LABELS.get(ch, ch), transform=ax.transAxes,
-                fontsize=5, color='#666', ha='right', va='bottom')
-        # ── Mean line ──
+                fontsize=5 if not is_solo else 7, color='#666', ha='right', va='bottom')
+
+        # Mean line
         ax.axvline(float(np.mean(data)), color=color, linestyle=':', linewidth=0.7, alpha=0.5)
         ax.grid(True, alpha=0.15, linestyle='--')
-        ax.tick_params(labelsize=5)
+        ax.tick_params(labelsize=6 if is_solo else 5)
 
-        # Depth ruler (unchanged)
+        # Depth ruler
         if depth_array is not None and len(depth_array) == n:
-            n_ticks = 10 if is_wide else 5
+            n_ticks = 12 if is_solo else (10 if ch == "gray" else 5)
             step = max(1, n // n_ticks)
             tick_rows = list(range(0, n, step))
             tick_labels = [f"{depth_array[i]:.2f}" for i in tick_rows]
             ax.set_yticks(tick_rows)
-            ax.set_yticklabels(tick_labels, fontsize=4)
-            if is_wide:
-                ax.set_ylabel("Depth (m)", fontsize=6, color='#999')
+            ax.set_yticklabels(tick_labels, fontsize=5 if not is_solo else 6)
+            if ch == "gray" or is_solo:
+                ax.set_ylabel("Depth (m)", fontsize=7, color='#999')
             for ss, se, bi in segments:
                 if ss > 0:
                     ax.axhline(ss, color='#F0B429', linestyle='-', linewidth=0.8, alpha=0.5)
@@ -288,16 +328,9 @@ class MultiChannelPlotWidget(FigureCanvasQTAgg):
                                 fontsize=4, color='#F0B429', ha='right', va='center',
                                 bbox=dict(boxstyle='round,pad=0.08', facecolor='white', alpha=0.7, edgecolor='none'))
 
-    def show_channels(self, channels):
-        """Show only specified channels, hide the rest. Accepts list of channel names."""
-        for ch in MultiChannelExtractor.CHANNELS:
-            if ch in self.axes:
-                self.axes[ch].set_visible(ch in channels)
-        self.draw()
-
-    def plot(self, profiles, segments, depth_array=None, illum_corrected=False, trend_lines=None):
-        self._depth_data = (profiles, segments, depth_array, illum_corrected, trend_lines)
-        for ch in MultiChannelExtractor.CHANNELS:
+    def _do_plot(self, profiles, segments, depth_array, illum_corrected, trend_lines):
+        """Internal: render all channels for current view mode."""
+        for ch in self.axes:
             ax = self.axes[ch]; ax.clear()
             data = profiles.get(ch)
             if data is None or len(data) == 0:
@@ -308,6 +341,10 @@ class MultiChannelPlotWidget(FigureCanvasQTAgg):
                         bbox=dict(boxstyle='round,pad=0.2', facecolor='#999', alpha=0.7))
                 continue
             self._draw_one(ax, ch, data, len(data), segments, depth_array, illum_corrected, trend_lines)
+
+    def plot(self, profiles, segments, depth_array=None, illum_corrected=False, trend_lines=None):
+        self._plot_cache = (profiles, segments, depth_array, illum_corrected, trend_lines)
+        self._do_plot(profiles, segments, depth_array, illum_corrected, trend_lines)
         self.draw()
 
     def save_plots(self, path):
@@ -465,24 +502,45 @@ class OverlapMergeDialog(QtWidgets.QDialog):
 
 
 # ═══════════════════════════════════════════════
-#  Overlap merge engine
+#  Overlap merge engine (v6.0: depth-grid resampling)
 # ═══════════════════════════════════════════════
 
 class OverlapMerger:
-    """Merge overlapping depth profiles into a continuous sequence."""
+    """Merge overlapping depth profiles using depth-grid resampling.
+
+    Core insight: each group has its own pixel→depth mapping (linear).
+    Overlap MUST be computed in depth space, then mapped back to pixel
+    indices per-group. The previous pixel-space approach was the root
+    cause of the "crops a section downward" bug.
+
+    Algorithm (v6.0):
+      1. Map each group's pixel rows → depth values
+      2. Sort groups by top depth, find overlap depth ranges
+      3. For each group pair (A, B) with overlap:
+         a. Extract A's data from its top to overlap_end
+         b. Extract B's data from overlap_start to its bottom
+         c. Merge the overlapping portion by chosen method
+         d. Concatenate: A(up to overlap) + merged + B(after overlap)
+      4. Result: one continuous profile with monotonically increasing depth
+    """
 
     @staticmethod
     def merge(profiles, segments, calibrator, groups, method="mean"):
         """Build a single continuous profile from per-group depth data.
-        Returns (merged_profiles, merged_segments, depth_array, merged_info)."""
-        if not calibrator.is_calibrated:
+
+        Returns (merged_profiles, merged_segments, depth_array, overlap_info).
+        """
+        if not calibrator.is_calibrated or not groups:
             return profiles, segments, None, {}
 
-        # Build per-row depth + group membership
         gray = profiles.get("gray", np.array([]))
-        n = len(gray)
-        depth = np.zeros(n, dtype=np.float32)
-        grp_id = np.full(n, -1, dtype=int)
+        n_total = len(gray)
+        if n_total == 0:
+            return profiles, segments, None, {}
+
+        # ── Step 1: Build per-row depth and group-id arrays ──
+        depth_arr = np.zeros(n_total, dtype=np.float32)
+        grp_id = np.full(n_total, -1, dtype=int)
 
         box2grp = {}
         for gi, grp in enumerate(groups):
@@ -493,89 +551,185 @@ class OverlapMerger:
             gi = box2grp.get(bi, 0)
             h = se - ss
             local = np.arange(h, dtype=np.float64)
-            depth[ss:se] = calibrator.pixel_to_depth(local, h, gi)
+            depth_arr[ss:se] = calibrator.pixel_to_depth(local, h, gi)
             grp_id[ss:se] = gi
 
-        # Detect overlap zones
-        sorted_groups = sorted(
+        # ── Step 2: Sort calibrated groups by top depth ──
+        cal_groups = sorted(
             [gi for gi in range(len(groups)) if calibrator.get_group(gi)],
             key=lambda gi: calibrator.get_group(gi)[0])
 
-        overlap_info = {}
-        merged_results = {ch: [] for ch in MultiChannelExtractor.CHANNELS}
-        merged_segments = []
-        offset = 0
+        if len(cal_groups) < 2:
+            return profiles, segments, depth_arr, {}
 
-        for a, b in zip(sorted_groups, sorted_groups[1:]):
+        # ── Step 3: Detect overlaps ──
+        overlap_info = {}
+        for a, b in zip(cal_groups, cal_groups[1:]):
             da = calibrator.get_group(a)
             db = calibrator.get_group(b)
-            overlap_start = max(da[0], db[0])
-            overlap_end = min(da[1], db[1])
-            if overlap_end <= overlap_start:
-                continue
-            overlap_info[(a, b)] = overlap_end - overlap_start
+            ov_start = max(da[0], db[0])
+            ov_end = min(da[1], db[1])
+            if ov_end > ov_start:
+                overlap_info[(a, b)] = (ov_start, ov_end)
 
-        # Simple concatenation with overlap handling
-        ordered_segments = []
-        for gi in sorted_groups:
-            rows = np.where(grp_id == gi)[0]
-            if len(rows) == 0:
-                continue
-            ss, se = int(rows[0]), int(rows[-1]) + 1
-            ordered_segments.append((gi, ss, se, depth[ss], depth[se - 1]))
+        if not overlap_info:
+            return profiles, segments, depth_arr, {}
 
-        # Process overlaps: for each adjacent pair, merge the overlap zone
-        final_data = {ch: [] for ch in MultiChannelExtractor.CHANNELS}
-        final_depth = []
-        final_segs = []
-        off = 0
+        # ── Step 4: Build merged profile ──
+        merged_data = {ch: [] for ch in MultiChannelExtractor.CHANNELS}
+        merged_depth = []
+        merged_segs = []
+        offset = 0
 
         i = 0
-        while i < len(ordered_segments):
-            gi, ss, se, d_start, d_end = ordered_segments[i]
-            data_block = {ch: profiles[ch][ss:se].copy() for ch in MultiChannelExtractor.CHANNELS}
-            depth_block = depth[ss:se].copy()
+        while i < len(cal_groups):
+            gi = cal_groups[i]
+            da = calibrator.get_group(gi)
+            rows_i = np.where(grp_id == gi)[0]
+            if len(rows_i) == 0:
+                i += 1; continue
+            ss_i, se_i = int(rows_i[0]), int(rows_i[-1]) + 1
+            depth_i = depth_arr[ss_i:se_i]
 
-            if i + 1 < len(ordered_segments):
-                gj, ss2, se2, d2_start, d2_end = ordered_segments[i + 1]
-                key = (gi, gj) if (gi, gj) in overlap_info else (gj, gi)
-                ov = overlap_info.get(key, 0)
-                if ov > 0:
-                    # Find overlap rows in each block
-                    # In gi block: rows where depth >= d2_start
-                    # In gj block: rows where depth <= d_end
-                    mask_i = depth_block >= d2_start
-                    mask_j = depth[ss2:se2] <= d_end
+            # Find the next group with overlap
+            if i + 1 < len(cal_groups):
+                gj = cal_groups[i + 1]
+                key = (gi, gj)
+                if key in overlap_info:
+                    ov_start, ov_end = overlap_info[key]
+                    rows_j = np.where(grp_id == gj)[0]
+                    ss_j, se_j = int(rows_j[0]), int(rows_j[-1]) + 1
+                    depth_j = depth_arr[ss_j:se_j]
+
+                    # In group i: find pixel indices for depth range [da[0], ov_end]
+                    # depth_i goes from da[0] to da[1]; find where depth crosses ov_end
+                    # Since depth increases with pixel index (top=shallow), ov_end is
+                    # somewhere in the middle if there's overlap below.
+                    mask_i_overlap = depth_i <= ov_end
+                    # The non-overlap portion of i: depth < ov_start
+                    mask_i_pre = depth_i < ov_start
+                    # The overlap portion: ov_start <= depth <= ov_end
+                    mask_i_ov = (depth_i >= ov_start) & (depth_i <= ov_end)
+
+                    # In group j: find pixel indices for depth range [ov_start, db[1]]
+                    mask_j_ov = (depth_j >= ov_start) & (depth_j <= ov_end)
+                    mask_j_post = depth_j > ov_end
 
                     if method == "mean":
-                        # Average the overlapping portions
-                        for ch in MultiChannelExtractor.CHANNELS:
-                            data_i = profiles[ch][ss:se][mask_i]
-                            data_j = profiles[ch][ss2:se2][mask_j]
-                            mn = min(len(data_i), len(data_j))
-                            if mn > 0:
-                                avg = (data_i[:mn] + data_j[:mn]) / 2.0
-                                data_block[ch][mask_i][:mn] = avg
-                        # Remove the overlap portion from block j
-                        ordered_segments[i + 1] = (gj, ss2 + sum(mask_j),
-                                                    se2, depth[se2 - 1], d2_end)
+                        # Extract overlap data from both groups
+                        ni_ov = np.sum(mask_i_ov)
+                        nj_ov = np.sum(mask_j_ov)
+                        if ni_ov > 0 and nj_ov > 0:
+                            # Resample to the finer grid
+                            mn = min(ni_ov, nj_ov)
+                            # Use the finer group's depth grid for the overlap zone
+                            if ni_ov <= nj_ov:
+                                # Use group i's grid, resample group j
+                                di_ov = depth_i[mask_i_ov]
+                                dj_ov = depth_j[mask_j_ov]
+                                for ch in MultiChannelExtractor.CHANNELS:
+                                    data_i_ov = profiles[ch][ss_i:se_i][mask_i_ov]
+                                    data_j_ov = profiles[ch][ss_j:se_j][mask_j_ov]
+                                    # Interpolate j's data onto i's depth grid
+                                    data_j_interp = np.interp(di_ov, dj_ov, data_j_ov)
+                                    merged_ov = (data_i_ov + data_j_interp) / 2.0
+                                    # Replace i's overlap data with merged version
+                                    profiles[ch][ss_i:se_i][mask_i_ov] = merged_ov
+                            else:
+                                # Use group j's grid, resample group i
+                                di_ov = depth_i[mask_i_ov]
+                                dj_ov = depth_j[mask_j_ov]
+                                for ch in MultiChannelExtractor.CHANNELS:
+                                    data_i_ov = profiles[ch][ss_i:se_i][mask_i_ov]
+                                    data_j_ov = profiles[ch][ss_j:se_j][mask_j_ov]
+                                    data_i_interp = np.interp(dj_ov, di_ov, data_i_ov)
+                                    merged_ov = (data_i_interp + data_j_ov) / 2.0
+                                    profiles[ch][ss_j:se_j][mask_j_ov] = merged_ov
 
-            # Append block i
+                    elif method == "keep_a":
+                        # Keep group i's data for overlap, skip group j's overlap
+                        # This means: use i's full range, then append j's post-overlap
+                        pass  # mask_j_ov data is simply not appended
+                    elif method == "keep_b":
+                        # Keep group j's data for overlap, skip group i's overlap
+                        mask_i_ov_fill = mask_i_ov.copy()
+                        # We'll skip i's overlap and use j's overlap instead
+                        pass
+
+                    # === Build final concatenation ===
+                    if method == "mean":
+                        # i's data (already has merged overlap) up to ov_end
+                        mask_i_keep = depth_i <= ov_end
+                        for ch in MultiChannelExtractor.CHANNELS:
+                            merged_data[ch].append(profiles[ch][ss_i:se_i][mask_i_keep])
+                        chunk_len = np.sum(mask_i_keep)
+                        merged_depth.append(depth_i[mask_i_keep])
+                        merged_segs.append((offset, offset + chunk_len, gi))
+                        offset += chunk_len
+
+                        # j's data from past ov_end
+                        if np.any(mask_j_post):
+                            for ch in MultiChannelExtractor.CHANNELS:
+                                merged_data[ch].append(profiles[ch][ss_j:se_j][mask_j_post])
+                            chunk_len_j = np.sum(mask_j_post)
+                            merged_depth.append(depth_j[mask_j_post])
+                            merged_segs.append((offset, offset + chunk_len_j, gj))
+                            offset += chunk_len_j
+
+                    elif method == "keep_a":
+                        # Take all of i, then j's post-overlap portion
+                        for ch in MultiChannelExtractor.CHANNELS:
+                            merged_data[ch].append(profiles[ch][ss_i:se_i])
+                        chunk_len = se_i - ss_i
+                        merged_depth.append(depth_i)
+                        merged_segs.append((offset, offset + chunk_len, gi))
+                        offset += chunk_len
+
+                        if np.any(mask_j_post):
+                            for ch in MultiChannelExtractor.CHANNELS:
+                                merged_data[ch].append(profiles[ch][ss_j:se_j][mask_j_post])
+                            chunk_len_j = np.sum(mask_j_post)
+                            merged_depth.append(depth_j[mask_j_post])
+                            merged_segs.append((offset, offset + chunk_len_j, gj))
+                            offset += chunk_len_j
+
+                    elif method == "keep_b":
+                        # Take i's pre-overlap, then all of j
+                        if np.any(mask_i_pre):
+                            for ch in MultiChannelExtractor.CHANNELS:
+                                merged_data[ch].append(profiles[ch][ss_i:se_i][mask_i_pre])
+                            chunk_len_i = np.sum(mask_i_pre)
+                            merged_depth.append(depth_i[mask_i_pre])
+                            merged_segs.append((offset, offset + chunk_len_i, gi))
+                            offset += chunk_len_i
+
+                        for ch in MultiChannelExtractor.CHANNELS:
+                            merged_data[ch].append(profiles[ch][ss_j:se_j])
+                        chunk_len_j = se_j - ss_j
+                        merged_depth.append(depth_j)
+                        merged_segs.append((offset, offset + chunk_len_j, gj))
+                        offset += chunk_len_j
+
+                    i += 2  # consumed both groups
+                    continue
+
+            # No overlap with next group → append group i as-is
             for ch in MultiChannelExtractor.CHANNELS:
-                final_data[ch].append(data_block[ch])
-            final_depth.append(depth_block)
-            se_len = len(data_block["gray"])
-            final_segs.append((off, off + se_len, gi))
-            off += se_len
+                merged_data[ch].append(profiles[ch][ss_i:se_i])
+            chunk_len = se_i - ss_i
+            merged_depth.append(depth_i)
+            merged_segs.append((offset, offset + chunk_len, gi))
+            offset += chunk_len
             i += 1
 
-        if not final_data["gray"]:
-            return profiles, segments, depth, overlap_info
+        # ── Step 5: Concatenate ──
+        if not merged_data["gray"]:
+            return profiles, segments, depth_arr, overlap_info
 
-        merged = {ch: np.concatenate(final_data[ch]) for ch in MultiChannelExtractor.CHANNELS}
-        merged_depth = np.concatenate(final_depth)
+        merged = {ch: np.concatenate(merged_data[ch]) for ch in MultiChannelExtractor.CHANNELS}
+        merged_depth_arr = np.concatenate(merged_depth)
 
-        return merged, final_segs, merged_depth, overlap_info
+        return merged, merged_segs, merged_depth_arr, overlap_info
 
 
 # ═══════════════════════════════════════════════
@@ -591,7 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._has_merged = False; self._merge_choice = "mean"
         self.raw_profiles = None; self.raw_segments = None; self._merged_depth = None
 
-        self.setWindowTitle("Gray Extractor v5.0")
+        self.setWindowTitle("Gray Extractor v6.0")
         self.setMinimumSize(1200, 750); self.resize(1600, 900)
         self._setup_ui(); self._setup_toolbar(); self._setup_statusbar()
         self.setAcceptDrops(True); self._apply_style()
@@ -686,7 +840,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_view.addItems(["All 6", "Gray + L*/a*", "Gray only"])
         self.combo_view.setCurrentIndex(0)
         self.combo_view.currentIndexChanged.connect(self._on_view_changed)
-        self.combo_view.setMinimumWidth(100)
+        self.combo_view.setMinimumWidth(120)
         tb.addWidget(self.combo_view)
 
     def _setup_statusbar(self):
@@ -733,6 +887,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_illum.setEnabled(has); self.act_csv.setEnabled(has); self.act_plots.setEnabled(has)
         self.btn_calib.setEnabled(has)
         self.illum_corrected = False; self.act_illum.setChecked(False); self.trend_lines = {}
+        self._has_merged = False; self.raw_profiles = None; self.raw_segments = None
         if has:
             self._update_depth_bar()
 
@@ -761,7 +916,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 for gi in range(len(groups)):
                     d = self.calibrator.get_group(gi)
                     if d:
-                        # Show group label on image
                         grp_boxes = groups[gi]
                         rep_box = self.boxes[grp_boxes[0]]
                         xb, yb = rep_box[0] - 30, rep_box[1] + rep_box[3] // 2
@@ -813,13 +967,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 if ch in self.profiles and len(self.profiles[ch])>0:
                     profiles_to_plot[ch], trend[ch] = IlluminationCorrector.correct(self.profiles[ch])
             self.trend_lines = trend
-        # Build per-group depth array
+        # Build depth array
         depth_arr = None
         if self.calibrator.is_calibrated and self.segments:
             n = len(self.profiles.get("gray", []))
             depth_arr = np.zeros(n, dtype=np.float32)
             groups = MultiChannelExtractor.group_boxes(self.boxes)
-            # Map box→group
             box2group = {}
             for gi, grp in enumerate(groups):
                 for bi in grp:
@@ -913,13 +1066,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.illum_corrected = checked; self._refresh_plot()
         self.sb.showMessage("Illumination correction " + ("ON" if checked else "OFF"))
 
-    # ── View toggle ──────────────────────────
+    # ── View toggle (v6.0: true layout switching) ──
 
     def _on_view_changed(self, idx):
-        if idx == 0:   ch = MultiChannelExtractor.CHANNELS
-        elif idx == 1: ch = ["gray", "L_star", "a_star"]
-        else:          ch = ["gray"]
-        self.plot_widget.show_channels(ch)
+        modes = ["all", "gray_lab", "gray"]
+        mode = modes[idx] if 0 <= idx < len(modes) else "all"
+        self.plot_widget.set_view_mode(mode)
 
     # ── Box reorder ───────────────────────────
 
@@ -1060,16 +1212,14 @@ class MainWindow(QtWidgets.QMainWindow):
                             (rb[0] + 5, rb[1] + 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 140, 0), 2)
 
-        # Highlight overlap zones with striped hatch
+        # Highlight overlap zones with cyan overlay + label
         for ga, gb in zip(all_cal, all_cal[1:]):
             da = self.calibrator.get_group(ga); db = self.calibrator.get_group(gb)
             ov = min(da[1], db[1]) - max(da[0], db[0])
             if ov > 0:
-                # Find overlap region in the first group's box area
                 grp_a = groups[ga]
                 for bi in grp_a:
                     bx, by, bw, bh = self.boxes[bi]
-                    # Mark the overlap zone on the image
                     overlay = display.copy()
                     cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh),
                                   (0, 200, 255), -1)
