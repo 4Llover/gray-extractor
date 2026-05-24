@@ -250,37 +250,50 @@ class MultiChannelPlotWidget(FigureCanvasQTAgg):
         for ss, se, bi in segments:
             ax.axhspan(ss, se, alpha=0.06, color=BOX_COLORS[bi % len(BOX_COLORS)])
         ax.fill_betweenx(y_vals, data, data.min(), alpha=0.15, color=color)
-        ax.plot(data, y_vals, color=color, linewidth=0.5)
+        ax.plot(data, y_vals, color=color, linewidth=0.45)
         if illum_corrected and trend_lines and ch in trend_lines:
-            ax.plot(trend_lines[ch], y_vals, '--', color='#999', linewidth=0.8, alpha=0.7)
-        ax.axvline(float(np.mean(data)), color=color, linestyle=':', linewidth=0.8, alpha=0.6)
-        ax.invert_yaxis()
-        title_size = 9 if ch == "gray" else 8
-        label_size = 7 if ch == "gray" else 6
-        ax.set_xlabel(CHANNEL_LABELS.get(ch, ch), fontsize=label_size)
-        ax.set_title(ch, fontsize=title_size, fontweight='bold', color=color)
-        ax.grid(True, alpha=0.2, linestyle='--')
-        ax.tick_params(labelsize=label_size - 1)
+            ax.plot(trend_lines[ch], y_vals, '--', color='#999', linewidth=0.7, alpha=0.7)
 
-        # Depth ruler
+        ax.invert_yaxis()
+        # ── Title: inside top-left with colored background ──
+        is_wide = (ch == "gray")
+        fs = 7 if is_wide else 6
+        ax.text(0.03, 0.96, f" {ch} ", transform=ax.transAxes,
+                fontsize=fs, fontweight='bold', color='white',
+                va='top', ha='left',
+                bbox=dict(boxstyle='round,pad=0.25', facecolor=color, alpha=0.85, edgecolor='none'))
+        # ── X-label: inside bottom-right ──
+        ax.text(0.97, 0.03, CHANNEL_LABELS.get(ch, ch), transform=ax.transAxes,
+                fontsize=5, color='#666', ha='right', va='bottom')
+        # ── Mean line ──
+        ax.axvline(float(np.mean(data)), color=color, linestyle=':', linewidth=0.7, alpha=0.5)
+        ax.grid(True, alpha=0.15, linestyle='--')
+        ax.tick_params(labelsize=5)
+
+        # Depth ruler (unchanged)
         if depth_array is not None and len(depth_array) == n:
-            n_ticks = 10 if ch == "gray" else 6
+            n_ticks = 10 if is_wide else 5
             step = max(1, n // n_ticks)
             tick_rows = list(range(0, n, step))
             tick_labels = [f"{depth_array[i]:.2f}" for i in tick_rows]
             ax.set_yticks(tick_rows)
-            ax.set_yticklabels(tick_labels, fontsize=5)
-            if ch == "gray":
-                ax.set_ylabel("Depth (m)", fontsize=7)
-            # Segment boundary markers — fix: label beside the LINE
+            ax.set_yticklabels(tick_labels, fontsize=4)
+            if is_wide:
+                ax.set_ylabel("Depth (m)", fontsize=6, color='#999')
             for ss, se, bi in segments:
                 if ss > 0:
-                    ax.axhline(ss, color='#F0B429', linestyle='-', linewidth=1.0, alpha=0.5)
-                    # Place label at the golden line position, not at inverted-axes position
-                    ax.annotate(f'{depth_array[min(ss, n-1)]:.2f}m',
+                    ax.axhline(ss, color='#F0B429', linestyle='-', linewidth=0.8, alpha=0.5)
+                    ax.annotate(f'{depth_array[min(ss, n-1)]:.2f}',
                                 xy=(0.98, ss), xycoords=('axes fraction', 'data'),
-                                fontsize=5, color='#F0B429', ha='right', va='center',
-                                bbox=dict(boxstyle='round,pad=0.1', facecolor='white', alpha=0.7, edgecolor='none'))
+                                fontsize=4, color='#F0B429', ha='right', va='center',
+                                bbox=dict(boxstyle='round,pad=0.08', facecolor='white', alpha=0.7, edgecolor='none'))
+
+    def show_channels(self, channels):
+        """Show only specified channels, hide the rest. Accepts list of channel names."""
+        for ch in MultiChannelExtractor.CHANNELS:
+            if ch in self.axes:
+                self.axes[ch].set_visible(ch in channels)
+        self.draw()
 
     def plot(self, profiles, segments, depth_array=None, illum_corrected=False, trend_lines=None):
         self._depth_data = (profiles, segments, depth_array, illum_corrected, trend_lines)
@@ -289,8 +302,10 @@ class MultiChannelPlotWidget(FigureCanvasQTAgg):
             data = profiles.get(ch)
             if data is None or len(data) == 0:
                 ax.text(0.5, 0.5, 'No data', transform=ax.transAxes, ha='center', va='center',
-                        fontsize=10, color='gray')
-                ax.set_title(ch, fontsize=8, fontweight='bold')
+                        fontsize=8, color='gray')
+                ax.text(0.03, 0.96, f" {ch} ", transform=ax.transAxes, fontsize=6,
+                        fontweight='bold', color='white', va='top',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='#999', alpha=0.7))
                 continue
             self._draw_one(ax, ch, data, len(data), segments, depth_array, illum_corrected, trend_lines)
         self.draw()
@@ -665,6 +680,15 @@ class MainWindow(QtWidgets.QMainWindow):
         a2 = QtGui.QAction("Re-detect", self); a2.setShortcut("F5")
         a2.triggered.connect(self._detect_and_extract); tb.addAction(a2)
 
+        tb.addSeparator()
+        tb.addWidget(QtWidgets.QLabel("View: "))
+        self.combo_view = QtWidgets.QComboBox()
+        self.combo_view.addItems(["All 6", "Gray + L*/a*", "Gray only"])
+        self.combo_view.setCurrentIndex(0)
+        self.combo_view.currentIndexChanged.connect(self._on_view_changed)
+        self.combo_view.setMinimumWidth(100)
+        tb.addWidget(self.combo_view)
+
     def _setup_statusbar(self):
         self.sb = self.statusBar()
         self.sb.showMessage("Ready — Open an image (Ctrl+O) or drag & drop")
@@ -873,6 +897,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._has_merged = False
 
         self._refresh_plot()
+        if self._has_merged:
+            self._redraw_image_with_merge()
         info = f"Group {gi+1}: {tm:.3f} – {bm:.3f} m"
         if overlaps:
             for a, b, ov in overlaps:
@@ -886,6 +912,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_illum(self, checked):
         self.illum_corrected = checked; self._refresh_plot()
         self.sb.showMessage("Illumination correction " + ("ON" if checked else "OFF"))
+
+    # ── View toggle ──────────────────────────
+
+    def _on_view_changed(self, idx):
+        if idx == 0:   ch = MultiChannelExtractor.CHANNELS
+        elif idx == 1: ch = ["gray", "L_star", "a_star"]
+        else:          ch = ["gray"]
+        self.plot_widget.show_channels(ch)
 
     # ── Box reorder ───────────────────────────
 
@@ -993,6 +1027,61 @@ class MainWindow(QtWidgets.QMainWindow):
             p = u.toLocalFile()
             if p.lower().endswith(('.png','.jpg','.jpeg','.bmp','.tiff','.tif')):
                 self._load_image(p); break
+
+    # ── Image refresh after merge ─────────────
+
+    def _redraw_image_with_merge(self):
+        """Redraw the image with merge zone highlights."""
+        if self.image_bgr is None: return
+        display = self.image_bgr.copy()
+        if not self.boxes: return
+        groups = MultiChannelExtractor.group_boxes(self.boxes)
+        all_cal = sorted([g for g in range(len(groups)) if self.calibrator.get_group(g)],
+                         key=lambda g: self.calibrator.get_group(g)[0])
+
+        # Draw boxes as usual
+        for gi, grp in enumerate(groups):
+            cb = self._h2b(BOX_COLORS[gi % len(BOX_COLORS)])
+            for pos, bi in enumerate(grp):
+                x, y, w, h = self.boxes[bi]
+                cv2.rectangle(display, (x, y), (x + w, y + h), cb, 3)
+                lbl = f"G{gi+1}#{pos+1}" if len(grp) > 1 else f"#{bi+1}"
+                (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)
+                cv2.rectangle(display, (x, y - lh - 10), (x + lw + 6, y), cb, -1)
+                cv2.putText(display, lbl, (x + 3, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        # Draw depth info on each calibrated group
+        for gi in all_cal:
+            d = self.calibrator.get_group(gi)
+            if d:
+                grp = groups[gi]
+                rb = self.boxes[grp[0]]
+                cv2.putText(display, f"G{gi+1}: {d[0]:.2f}–{d[1]:.2f}m",
+                            (rb[0] + 5, rb[1] + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 140, 0), 2)
+
+        # Highlight overlap zones with striped hatch
+        for ga, gb in zip(all_cal, all_cal[1:]):
+            da = self.calibrator.get_group(ga); db = self.calibrator.get_group(gb)
+            ov = min(da[1], db[1]) - max(da[0], db[0])
+            if ov > 0:
+                # Find overlap region in the first group's box area
+                grp_a = groups[ga]
+                for bi in grp_a:
+                    bx, by, bw, bh = self.boxes[bi]
+                    # Mark the overlap zone on the image
+                    overlay = display.copy()
+                    cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh),
+                                  (0, 200, 255), -1)
+                    display = cv2.addWeighted(display, 0.85, overlay, 0.15, 0)
+                    cv2.putText(display, f" MERGED ({ov:.1f}m) ",
+                                (bx + bw // 2 - 60, by + bh // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 200), 2)
+
+        drgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        hh, ww, chh = drgb.shape
+        qi = QtGui.QImage(drgb.data, ww, hh, chh * ww, QtGui.QImage.Format.Format_RGB888)
+        self.image_view.set_image(qi)
 
     @staticmethod
     def _h2b(h): return (int(h[5:7],16), int(h[3:5],16), int(h[1:3],16))
