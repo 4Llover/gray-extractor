@@ -1,28 +1,90 @@
 """
-Gray Extractor v7.0 — Clean Slate
-==================================
-v7.0 changes:
-  - REMOVED OverlapMerger and OverlapMergeDialog (dead code — 210 lines)
-  - REMOVED all merge-related state from MainWindow (_has_merged, raw_profiles, etc.)
-  - Simplified _apply_depth: just set depth, no merge dialog
-  - Simplified _export_csv: no dual raw/merged columns
-  - Added: "Clear Depth" button to reset per-group calibration
-  - Added: depth gap warning between adjacent groups
-  - Deduplicated: depth array building extracted to _build_depth_array()
-  - Simplified _redraw_image: single method, no merge-specific variant
-
-Kept from v6.0:
-  - True view switching with set_view_mode() (all / gray_lab / gray)
-  - Per-group depth calibration with DepthCalibrator
-  - Zoomable image viewer, illumination correction
-  - Box grouping (parallel detection with 35% center-distance threshold)
-  - 6-channel extraction + CSV/plot export
+Gray Extractor v8.1 — Thickness Popup Dialog
+===========================================
+v8.1: Thickness mode now opens a popup dialog with 5 tabbed panels
+  - Each panel = standalone FigureCanvas + NavigationToolbar
+  - Zoom/pan/save on every panel individually
+  - Real-time update when σ or Prom changes
+v8.0: Added thickness analysis mode (View → Thickness)
+  - BedBoundaryDetector: valley detection → bed boundaries → thickness
+v7.0-v7.2: Clean slate, dual raw/corr CSV, inner boundary viz, info table
 """
 import sys, os, csv
 import numpy as np, cv2
 from PyQt6 import QtCore, QtGui, QtWidgets
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+
+# ── Optional scipy imports (fallback to numpy if unavailable) ──
+try:
+    from scipy.signal import find_peaks
+    from scipy.ndimage import gaussian_filter1d as _gauss1d
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
+    def _gauss1d(data, sigma):
+        """Pure numpy Gaussian filter fallback."""
+        if sigma < 0.5:
+            return data.astype(np.float64)
+        # Truncate at 4*sigma
+        radius = int(np.ceil(4 * sigma))
+        x = np.arange(-radius, radius + 1, dtype=np.float64)
+        kernel = np.exp(-0.5 * (x / sigma) ** 2)
+        kernel /= kernel.sum()
+        return np.convolve(data.astype(np.float64), kernel, mode='same')
+
+    def find_peaks(data, height=None, prominence=None, distance=1):
+        """Pure numpy peak detection fallback.
+        Detects local maxima via simple comparison with neighbors.
+        Only distance and prominence are supported; height is ignored unless
+        used as a simple threshold."""
+        data = np.asarray(data, dtype=np.float64)
+        n = len(data)
+        if n < 3:
+            return np.array([], dtype=int), {}
+
+        # Local maxima: greater than both neighbors
+        peaks = np.where((data[1:-1] > data[:-2]) & (data[1:-1] > data[2:]))[0] + 1
+
+        # Distance filter: keep highest peak in each sliding window
+        if distance > 1 and len(peaks) > 0:
+            kept = []
+            i = 0
+            while i < len(peaks):
+                window_end = i
+                while (window_end + 1 < len(peaks) and
+                       peaks[window_end + 1] - peaks[i] < distance):
+                    window_end += 1
+                best = i + np.argmax(data[peaks[i:window_end + 1]])
+                kept.append(peaks[best])
+                i = window_end + 1
+            peaks = np.array(kept, dtype=int)
+
+        # Prominence filter (simplified)
+        if prominence is not None and prominence > 0 and len(peaks) > 0:
+            prom_values = np.zeros(len(peaks))
+            for j, p in enumerate(peaks):
+                # Find lowest valley to the left
+                left_min = data[p]
+                for k in range(p - 1, -1, -1):
+                    if data[k] < left_min:
+                        left_min = data[k]
+                    if k > 0 and data[k] > data[p]:
+                        break
+                # Find lowest valley to the right
+                right_min = data[p]
+                for k in range(p + 1, n):
+                    if data[k] < right_min:
+                        right_min = data[k]
+                    if k < n - 1 and data[k] > data[p]:
+                        break
+                prom_values[j] = data[p] - max(left_min, right_min)
+            peaks = peaks[prom_values >= prominence]
+
+        props = {}
+        return peaks, props
 
 # ═══════════════════════════════════════════════
 #  Multi-channel extraction engine
@@ -203,6 +265,139 @@ class RedBoxDetector:
         if not boxes: return [], raw
         boxes.sort(key=lambda b: b[1]+b[3], reverse=True)
         return boxes, raw
+
+
+# ═══════════════════════════════════════════════
+#  Bed boundary detector — grayscale → thickness
+# ═══════════════════════════════════════════════
+
+class BedBoundaryDetector:
+    """Detect bed boundaries from a grayscale profile and compute bed thicknesses.
+
+    Principle:
+      - Layer boundaries appear as sharp dark→light transitions in grayscale.
+      - The boundary position is the PEAK of the gradient, not a specific gray value.
+      - This is robust to lighting variations — a 20% overall brightness change
+        doesn't shift where the gradient peaks.
+
+    Algorithm:
+      1. Gaussian smooth to suppress pixel-level noise
+      2. Find local minima (dark = muddy/clay-rich layer boundaries) OR
+         find gradient magnitude peaks (|d(gray)/dy| maxima)
+      3. Filter by prominence and minimum distance
+      4. Compute bed thickness = distance between consecutive boundaries
+    """
+
+    # We use valley detection (local minima) as default for carbonate rocks:
+    # dark troughs = argillaceous/mud-rich interbeds = layer boundaries.
+    # The alternative (gradient peak) works better for sharp lithologic contacts.
+
+    def __init__(self, method="valley"):
+        self.method = method
+        self._boundaries = None       # pixel indices of detected boundaries
+        self._thickness = None        # bed thicknesses (same unit as input)
+        self._boundary_depths = None  # depth/position of each boundary
+
+    def detect(self, gray, depth=None, smooth_sigma=3.0, prominence=None,
+               min_thickness=None, min_thickness_unit='px'):
+        """Detect bed boundaries from grayscale profile.
+
+        Args:
+            gray: 1D array of grayscale values
+            depth: optional depth array (for calibrated output). If None, uses pixel index.
+            smooth_sigma: Gaussian filter sigma (controls scale sensitivity).
+                          Smaller → finer beds. Larger → only major boundaries.
+            prominence: minimum valley depth for a boundary to count.
+                        Default: 0.3 * std(smoothed_gray)
+            min_thickness: minimum distance between boundaries.
+                           Default: 3 * smooth_sigma
+            min_thickness_unit: 'px' or 'cm'. If 'cm', min_thickness is in cm
+                               and requires depth array.
+
+        Returns:
+            self (boundaries, thickness, boundary_depths are set as attributes)
+        """
+        n = len(gray)
+        if n < 10:
+            self._boundaries = np.array([], dtype=int)
+            self._thickness = np.array([], dtype=np.float64)
+            self._boundary_depths = np.array([], dtype=np.float64)
+            return self
+
+        # Step 1: Smooth
+        gray_f = gray.astype(np.float64)
+        smoothed = _gauss1d(gray_f, smooth_sigma)
+
+        # Step 2: Default parameters
+        if prominence is None:
+            prominence = np.std(smoothed) * 0.3
+        if min_thickness is None:
+            min_thickness = max(3, int(smooth_sigma * 3))
+
+        # Convert min_thickness from cm to px if depth is provided
+        if min_thickness_unit == 'cm' and depth is not None:
+            # Find approximate px/cm ratio
+            depth_spacing = np.median(np.diff(depth))
+            if depth_spacing > 0:
+                min_thickness = max(3, int(min_thickness / float(depth_spacing) / 100))
+            else:
+                min_thickness = max(3, int(smooth_sigma * 3))
+
+        # Step 3: Find boundaries as valleys (local minima of gray)
+        # Valleys = peaks of -smoothed
+        peaks, props = find_peaks(
+            -smoothed,
+            prominence=prominence,
+            distance=max(2, min_thickness)
+        )
+
+        self._boundaries = np.asarray(peaks, dtype=int)
+
+        # Step 4: Compute thickness and boundary positions
+        if depth is not None and len(depth) == n:
+            self._boundary_depths = depth[peaks]
+            if len(peaks) >= 2:
+                self._thickness = np.diff(self._boundary_depths)
+            else:
+                self._thickness = np.array([], dtype=np.float64)
+        else:
+            self._boundary_depths = peaks.astype(np.float64)
+            if len(peaks) >= 2:
+                self._thickness = np.diff(peaks).astype(np.float64)
+            else:
+                self._thickness = np.array([], dtype=np.float64)
+
+        return self
+
+    @property
+    def n_beds(self):
+        return max(0, len(self._boundaries) - 1)
+
+    @property
+    def boundaries(self):
+        return self._boundaries if self._boundaries is not None else np.array([], dtype=int)
+
+    @property
+    def thickness(self):
+        return self._thickness if self._thickness is not None else np.array([], dtype=np.float64)
+
+    @property
+    def boundary_depths(self):
+        return self._boundary_depths if self._boundary_depths is not None else np.array([], dtype=np.float64)
+
+    def stats(self):
+        """Return a dict of statistics suitable for display."""
+        t = self.thickness
+        if len(t) < 2:
+            return {"n_beds": 0, "median": 0, "mean": 0, "min": 0, "max": 0, "std": 0}
+        return {
+            "n_beds": self.n_beds,
+            "median": float(np.median(t)),
+            "mean": float(np.mean(t)),
+            "min": float(np.min(t)),
+            "max": float(np.max(t)),
+            "std": float(np.std(t)),
+        }
 
 
 # ═══════════════════════════════════════════════
@@ -428,6 +623,297 @@ class BoxListWidget(QtWidgets.QWidget):
 #  Main window
 # ═══════════════════════════════════════════════
 
+
+# ============================================================
+#  Thickness Analysis Dialog (v8.1 — popup with 5 tabbed panels)
+# ============================================================
+
+class ThicknessDialog(QtWidgets.QDialog):
+    """Popup dialog with 5 tabbed panels for bed thickness analysis.
+    Each tab is a standalone FigureCanvas with its own NavigationToolbar.
+    """
+
+    C = {'green': '#1A9C6E', 'orange': '#E8734A', 'blue': '#2D7DD2',
+         'gold': '#F0B429', 'red': '#D64545', 'gray': '#666'}
+
+    def __init__(self, parent, gray, detector, depth_array, segments):
+        super().__init__(parent)
+        self.gray = gray
+        self.detector = detector
+        self.depth_array = depth_array
+        self.segments = segments
+        self.n = len(gray)
+
+        self.setWindowTitle("Bed Thickness Analysis")
+        self.resize(1050, 750)
+        self.setMinimumSize(800, 550)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # Tab widget
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setStyleSheet("QTabWidget::pane{border:1px solid #ccc;} "
+                                "QTabBar::tab{padding:5px 12px;}")
+        layout.addWidget(self.tabs)
+
+        # Stats bar at bottom
+        self.lbl_stats = QtWidgets.QLabel("")
+        self.lbl_stats.setStyleSheet("background:#f5f5f5; border:1px solid #ddd; "
+                                      "padding:4px; font-size:11px; font-family:monospace;")
+        layout.addWidget(self.lbl_stats)
+
+        # Build 5 tabs
+        self.tabs.addTab(self._make_tab("gray_panel", "Gray + Bounds"), "Gray+Bounds")
+        self.tabs.addTab(self._make_tab("thickness_panel", "Thickness"), "Thickness")
+        self.tabs.addTab(self._make_tab("cumulative_panel", "Cumulative"), "Cumulative")
+        self.tabs.addTab(self._make_tab("histogram_panel", "Histogram"), "Histogram")
+        self.tabs.addTab(self._make_tab("stats_panel", "Summary"), "Summary")
+
+        self._draw_all()
+        self.tabs.currentChanged.connect(lambda _: self._draw_current())
+
+    def _make_tab(self, name, title):
+        page = QtWidgets.QWidget()
+        l = QtWidgets.QVBoxLayout(page)
+        l.setContentsMargins(0, 0, 0, 0)
+        fig = Figure(figsize=(10, 7), dpi=100)
+        fig.set_facecolor('#fafafa')
+        canvas = FigureCanvasQTAgg(fig)
+        canvas.setMinimumSize(600, 400)
+        toolbar = NavigationToolbar(canvas, self)
+        toolbar.setStyleSheet("QToolBar{border-bottom:1px solid #ddd; spacing:2px;}")
+        l.addWidget(toolbar)
+        l.addWidget(canvas, 1)
+        setattr(self, f'_{name}_fig', fig)
+        setattr(self, f'_{name}_canvas', canvas)
+        return page
+
+    def update_data(self, detector, depth_array=None):
+        self.detector = detector
+        if depth_array is not None:
+            self.depth_array = depth_array
+        self._draw_all()
+
+    def _draw_all(self):
+        self._draw_gray_panel()
+        self._draw_thickness_panel()
+        self._draw_cumulative_panel()
+        self._draw_histogram_panel()
+        self._draw_stats_panel()
+        self._update_stats_label()
+
+    def _draw_current(self):
+        idx = self.tabs.currentIndex()
+        methods = [self._draw_gray_panel, self._draw_thickness_panel,
+                   self._draw_cumulative_panel, self._draw_histogram_panel,
+                   self._draw_stats_panel]
+        if 0 <= idx < len(methods):
+            methods[idx]()
+        self._update_stats_label()
+
+    # ---- Panel (1): Gray + Boundaries ----
+
+    def _draw_gray_panel(self):
+        fig = getattr(self, '_gray_panel_fig', None)
+        if fig is None:
+            return
+        fig.clear()
+        ax = fig.add_subplot(111)
+        gray = self.gray
+        n = self.n
+        boundaries = self.detector.boundaries if self.detector is not None else np.array([], dtype=int)
+
+        ax.plot(gray, np.arange(n), color=self.C['blue'], linewidth=0.5)
+        for ss, se, bi in self.segments:
+            ax.axhspan(ss, se, alpha=0.04, color=BOX_COLORS[bi % len(BOX_COLORS)])
+        for b in boundaries:
+            ax.axhline(y=b, color=self.C['orange'], linewidth=0.8, alpha=0.7, linestyle='--')
+        ax.invert_yaxis()
+        n_beds = max(0, len(boundaries) - 1)
+        ax.set_title(f'Gray Profile + {n_beds} Bed Boundaries',
+                     fontsize=9, loc='left', fontweight='bold')
+        ax.set_xlabel('Gray value', fontsize=7, color=self.C['gray'])
+        ax.tick_params(labelsize=6)
+        has_depth = self.depth_array is not None and len(self.depth_array) == n
+        if has_depth:
+            da = self.depth_array
+            n_ticks = 10
+            step = max(1, n // n_ticks)
+            tick_rows = list(range(0, n, step))
+            ax.set_yticks(tick_rows)
+            ax.set_yticklabels([f"{da[i]:.2f}" for i in tick_rows], fontsize=5)
+            ax.set_ylabel('Depth (m)', fontsize=7, color=self.C['gray'])
+        ax.grid(True, alpha=0.12, linestyle='--')
+        fig.canvas.draw()
+
+    # ---- Panel (2): Bed Thickness Bars ----
+
+    def _draw_thickness_panel(self):
+        fig = getattr(self, '_thickness_panel_fig', None)
+        if fig is None:
+            return
+        fig.clear()
+        ax = fig.add_subplot(111)
+        d = self.detector
+        if d is None or d.n_beds < 1:
+            ax.text(0.5, 0.5, 'No beds detected', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=10, color='gray')
+            fig.canvas.draw()
+            return
+
+        boundaries = d.boundaries
+        thickness = d.thickness
+        n_beds = d.n_beds
+        has_depth = self.depth_array is not None and len(self.depth_array) == self.n
+
+        for i in range(n_beds):
+            b0, b1 = boundaries[i], boundaries[i + 1]
+            mid = int((b0 + b1) / 2)
+            y_pos = self.depth_array[mid] if has_depth else mid
+            # Bar height MUST be in Y-axis units: meters (depth) or pixels
+            bar_height = thickness[i] if has_depth else (b1 - b0)
+            ax.barh(y_pos, thickness[i], height=bar_height, color=self.C['blue'],
+                    alpha=0.55, edgecolor=self.C['blue'], linewidth=0.3)
+
+        ax.axvline(x=np.median(thickness), color=self.C['orange'], linewidth=0.8,
+                   linestyle='--', label=f"median={np.median(thickness):.3f}")
+        ax.invert_yaxis()
+        ax.set_xlabel('Thickness (m)' if has_depth else 'Thickness (px)',
+                      fontsize=7, color=self.C['gray'])
+        ax.set_title(f'Bed Thickness ({n_beds} beds)', fontsize=9, loc='left',
+                     fontweight='bold')
+        ax.legend(fontsize=7, loc='lower right')
+        ax.tick_params(labelsize=6)
+        ax.grid(True, alpha=0.12, linestyle='--')
+        if has_depth:
+            ax.set_ylim(self.depth_array[-1], self.depth_array[0])
+        else:
+            ax.set_ylim(self.n, 0)
+        fig.canvas.draw()
+
+    # ---- Panel (3): Cumulative Deviation ----
+
+    def _draw_cumulative_panel(self):
+        fig = getattr(self, '_cumulative_panel_fig', None)
+        if fig is None:
+            return
+        fig.clear()
+        ax = fig.add_subplot(111)
+        d = self.detector
+        if d is None or d.n_beds < 2:
+            ax.text(0.5, 0.5, 'Need >= 2 beds', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=10, color='gray')
+            fig.canvas.draw()
+            return
+
+        thickness = d.thickness
+        cum = np.cumsum(thickness)
+        x_cum = np.arange(len(cum), dtype=np.float64)
+        slope, intercept = np.polyfit(x_cum, cum, 1)
+        trend = slope * x_cum + intercept
+        cum_resid = cum - trend
+
+        ax.plot(x_cum, cum_resid, color=self.C['gold'], linewidth=0.8)
+        ax.fill_between(x_cum, 0, cum_resid, where=(cum_resid > 0),
+                        color=self.C['orange'], alpha=0.25)
+        ax.fill_between(x_cum, 0, cum_resid, where=(cum_resid < 0),
+                        color=self.C['blue'], alpha=0.25)
+        ax.axhline(y=0, color='gray', linewidth=0.4, linestyle='--')
+        ax.set_xlabel('Bed number', fontsize=7, color=self.C['gray'])
+        unit = 'm' if self.depth_array is not None else 'px'
+        ax.set_ylabel(f'Deviation ({unit})', fontsize=7, color=self.C['gray'])
+        ax.set_title('Cumulative Thickness Deviation', fontsize=9, loc='left',
+                     fontweight='bold')
+        ax.tick_params(labelsize=6)
+        ax.grid(True, alpha=0.12, linestyle='--')
+        fig.canvas.draw()
+
+    # ---- Panel (4): Histogram ----
+
+    def _draw_histogram_panel(self):
+        fig = getattr(self, '_histogram_panel_fig', None)
+        if fig is None:
+            return
+        fig.clear()
+        ax = fig.add_subplot(111)
+        d = self.detector
+        if d is None or d.n_beds < 3:
+            ax.text(0.5, 0.5, 'Need >= 3 beds', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=10, color='gray')
+            fig.canvas.draw()
+            return
+
+        thickness = d.thickness
+        n_beds = d.n_beds
+        bins = max(6, min(30, int(np.sqrt(n_beds))))
+        ax.hist(thickness, bins=bins, density=True, color=self.C['blue'],
+                alpha=0.35, edgecolor=self.C['blue'], linewidth=0.3)
+        ax.axvline(x=np.median(thickness), color=self.C['orange'], linewidth=0.8,
+                   linestyle='--', label=f"median={np.median(thickness):.3f}")
+        unit = 'm' if self.depth_array is not None else 'px'
+        ax.set_xlabel(f'Thickness ({unit})', fontsize=7, color=self.C['gray'])
+        ax.set_ylabel('Density', fontsize=7, color=self.C['gray'])
+        ax.set_title(f'Thickness Distribution (n={n_beds})', fontsize=9, loc='left',
+                     fontweight='bold')
+        ax.legend(fontsize=7, loc='upper right')
+        ax.tick_params(labelsize=6)
+        fig.canvas.draw()
+
+    # ---- Panel (5): Summary Text ----
+
+    def _draw_stats_panel(self):
+        fig = getattr(self, '_stats_panel_fig', None)
+        if fig is None:
+            return
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.axis('off')
+
+        d = self.detector
+        if d is None or d.n_beds < 1:
+            ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=12, color='gray')
+            fig.canvas.draw()
+            return
+
+        s = d.stats()
+        u = 'm' if self.depth_array is not None else 'px'
+        text = (
+            "Bed Thickness Statistics\n"
+            "=======================\n\n"
+            f"  Beds detected:  {s['n_beds']}\n"
+            f"  Median:         {s['median']:.4f} {u}\n"
+            f"  Mean:           {s['mean']:.4f} {u}\n"
+            f"  Std dev:        {s['std']:.4f} {u}\n"
+            f"  Min:            {s['min']:.4f} {u}\n"
+            f"  Max:            {s['max']:.4f} {u}\n\n"
+            "Parameter Guide\n"
+            "===============\n\n"
+            "  sigma     smaller -> finer beds\n"
+            "  Prom      lower   -> more boundaries\n"
+            "  Target:   median 3-5 cm for PL carbonate\n"
+            "  Target:   n ~ 30-50 for 1.5 m section"
+        )
+        ax.text(0.08, 0.98, text, transform=ax.transAxes, fontsize=10,
+                family='monospace', ha='left', va='top', color=self.C['gray'],
+                linespacing=1.6)
+        fig.canvas.draw()
+
+    def _update_stats_label(self):
+        d = self.detector
+        if d is None or d.n_beds < 1:
+            self.lbl_stats.setText("No beds detected")
+            return
+        s = d.stats()
+        u = 'm' if self.depth_array is not None else 'px'
+        self.lbl_stats.setText(
+            f"  n = {s['n_beds']}  |  median = {s['median']:.3f} {u}  |  "
+            f"mean = {s['mean']:.3f}  |  sd = {s['std']:.3f}  |  "
+            f"range = [{s['min']:.3f}, {s['max']:.3f}]"
+        )
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -436,7 +922,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.illum_corrected = False; self.trend_lines = {}; self.red_mask = None
         self.inner_boxes = []  # inner ROI after border trim (for visualization)
 
-        self.setWindowTitle("Gray Extractor v7.2")
+        self.setWindowTitle("Gray Extractor v8.1")
         self.setMinimumSize(1200, 750); self.resize(1600, 900)
         self._setup_ui(); self._setup_toolbar(); self._setup_statusbar()
         self.setAcceptDrops(True); self._apply_style()
@@ -558,11 +1044,43 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addSeparator()
         tb.addWidget(QtWidgets.QLabel("View: "))
         self.combo_view = QtWidgets.QComboBox()
-        self.combo_view.addItems(["All 6", "Gray + L*/a*", "Gray only"])
+        self.combo_view.addItems(["All 6", "Gray + L*/a*", "Gray only", "Thickness"])
         self.combo_view.setCurrentIndex(0)
         self.combo_view.currentIndexChanged.connect(self._on_view_changed)
         self.combo_view.setMinimumWidth(120)
         tb.addWidget(self.combo_view)
+
+        tb.addSeparator()
+        self.btn_detect_beds = QtWidgets.QPushButton("Detect Beds")
+        self.btn_detect_beds.clicked.connect(self._run_thickness_detection)
+        self.btn_detect_beds.setEnabled(False)
+        self.btn_detect_beds.setStyleSheet("padding:2px 8px; background:#E8734A; color:white; border-radius:3px;")
+        tb.addWidget(self.btn_detect_beds)
+
+        tb.addWidget(QtWidgets.QLabel(" σ:"))
+        self.spin_sigma = QtWidgets.QDoubleSpinBox()
+        self.spin_sigma.setDecimals(1); self.spin_sigma.setRange(1, 20); self.spin_sigma.setValue(3.0)
+        self.spin_sigma.setToolTip("Smoothing (sigma)\nSmaller = finer beds, Larger = only major boundaries")
+        self.spin_sigma.setSuffix(" px"); self.spin_sigma.setMinimumWidth(70)
+        self.spin_sigma.valueChanged.connect(self._run_thickness_detection)
+        tb.addWidget(self.spin_sigma)
+
+        tb.addWidget(QtWidgets.QLabel(" Prom:"))
+        self.spin_prom = QtWidgets.QDoubleSpinBox()
+        self.spin_prom.setDecimals(2); self.spin_prom.setRange(0.05, 50); self.spin_prom.setValue(3.0)
+        self.spin_prom.setToolTip("Prominence (minimum valley depth)\nLower = more boundaries")
+        self.spin_prom.setMinimumWidth(65)
+        self.spin_prom.valueChanged.connect(self._run_thickness_detection)
+        tb.addWidget(self.spin_prom)
+
+        self.act_export_beds = QtGui.QAction("Export Beds", self)
+        self.act_export_beds.setShortcut("Ctrl+B"); self.act_export_beds.triggered.connect(self._export_beds_csv)
+        self.act_export_beds.setEnabled(False); tb.addAction(self.act_export_beds)
+
+        # Hide thickness controls initially (only visible in Thickness view mode)
+        self.btn_detect_beds.setVisible(False)
+        self.spin_sigma.setVisible(False)
+        self.spin_prom.setVisible(False)
 
     def _setup_statusbar(self):
         self.sb = self.statusBar()
@@ -608,6 +1126,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_illum.setEnabled(has); self.act_csv.setEnabled(has); self.act_plots.setEnabled(has)
         self.btn_calib.setEnabled(has); self.btn_clear_depth.setEnabled(False)
         self.btn_reset_all.setEnabled(False)
+        self.btn_detect_beds.setEnabled(has)
         self.illum_corrected = False; self.act_illum.setChecked(False); self.trend_lines = {}
         if has:
             self._update_depth_bar()
@@ -912,9 +1431,132 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── View toggle ──────────────────────────
 
     def _on_view_changed(self, idx):
-        modes = ["all", "gray_lab", "gray"]
+        modes = ["all", "gray_lab", "gray", "thickness"]
         mode = modes[idx] if 0 <= idx < len(modes) else "all"
+        if mode == "thickness":
+            # Popup dialog instead of inline view
+            self._show_thickness_dialog()
+            # Reset combo back to previous view
+            self.combo_view.blockSignals(True)
+            self.combo_view.setCurrentIndex(0)
+            self.combo_view.blockSignals(False)
+            return
         self.plot_widget.set_view_mode(mode)
+        # Hide thickness-specific controls when not in thickness mode
+        self.spin_sigma.setVisible(False)
+        self.spin_prom.setVisible(False)
+        self.btn_detect_beds.setVisible(False)
+        self.act_export_beds.setVisible(False)
+
+    # ── Thickness dialog ────────────────────────
+
+    def _show_thickness_dialog(self):
+        gray = self.profiles.get("gray", np.array([]))
+        if len(gray) == 0:
+            self.sb.showMessage("No grayscale data")
+            return
+        depth_arr = self._build_depth_array()
+        sigma = self.spin_sigma.value()
+        prom = self.spin_prom.value()
+
+        detector = BedBoundaryDetector()
+        detector.detect(gray, depth=depth_arr, smooth_sigma=sigma, prominence=prom)
+
+        # Store for export and parameter updates
+        self._detector = detector
+        self._depth_arr = depth_arr
+
+        # Show toolbar controls
+        self.spin_sigma.setVisible(True)
+        self.spin_prom.setVisible(True)
+        self.btn_detect_beds.setVisible(True)
+        self.act_export_beds.setVisible(True)
+        self.act_export_beds.setEnabled(detector.n_beds >= 1)
+
+        # Create and show dialog (non-modal so user can still adjust sigma/prom)
+        dlg = ThicknessDialog(self, gray, detector, depth_arr, self.segments)
+        dlg.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        dlg.finished.connect(self._on_thickness_dialog_closed)
+        dlg.show()
+        self._thickness_dialog = dlg
+
+    def _on_thickness_dialog_closed(self):
+        self.spin_sigma.setVisible(False)
+        self.spin_prom.setVisible(False)
+        self.btn_detect_beds.setVisible(False)
+        self.act_export_beds.setVisible(False)
+        if self._thickness_dialog is not None:
+            self._thickness_dialog.deleteLater()
+        self._thickness_dialog = None
+
+    def _run_thickness_detection(self):
+        """Re-run detection (called when sigma/prom changes) and update dialog."""
+        dlg = getattr(self, '_thickness_dialog', None)
+        if dlg is None or not dlg.isVisible():
+            return
+        gray = self.profiles.get("gray", np.array([]))
+        if len(gray) == 0:
+            return
+        depth_arr = self._build_depth_array()
+        sigma = self.spin_sigma.value()
+        prom = self.spin_prom.value()
+
+        detector = BedBoundaryDetector()
+        detector.detect(gray, depth=depth_arr, smooth_sigma=sigma, prominence=prom)
+        self._detector = detector
+        self._depth_arr = depth_arr
+
+        dlg.update_data(detector, depth_arr)
+        stats = detector.stats()
+        unit = "m" if depth_arr is not None else "px"
+        self.sb.showMessage(
+            f"Bed detection: {detector.n_beds} beds, "
+            f"median thickness={stats['median']:.3f} {unit}, "
+            f"range=[{stats['min']:.3f}, {stats['max']:.3f}]"
+        )
+        self.act_export_beds.setEnabled(detector.n_beds >= 1)
+
+    def _export_beds_csv(self):
+        """Export bed boundary and thickness data as CSV."""
+        detector = getattr(self, '_detector', None)
+        if detector is None or detector.n_beds < 1:
+            self.sb.showMessage("No beds detected — run Thickness view first")
+            return
+        depth_array = getattr(self, '_depth_arr', None)
+
+        dn = "beds.csv"
+        if self.current_path:
+            dn = f"{os.path.splitext(os.path.basename(self.current_path))[0]}_beds.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Bed Data", dn, "CSV (*.csv);;All (*)")
+        if not path: return
+
+        # Build rows
+        boundaries_depth = detector.boundary_depths
+        thickness = detector.thickness
+        n_beds = detector.n_beds
+        has_depth = depth_array is not None
+
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            hdrs = ["bed_id", "top", "bottom", "thickness"]
+            if has_depth:
+                hdrs[1] = "top_m"; hdrs[2] = "bottom_m"; hdrs[3] = "thickness_m"
+            w.writerow(hdrs)
+            if has_depth:
+                for i in range(n_beds):
+                    w.writerow([i+1,
+                               round(float(boundaries_depth[i]), 4),
+                               round(float(boundaries_depth[i+1]), 4),
+                               round(float(thickness[i]), 4)])
+            else:
+                for i in range(n_beds):
+                    w.writerow([i+1,
+                               int(boundaries_depth[i]),
+                               int(boundaries_depth[i+1]),
+                               round(float(thickness[i]), 2)])
+
+        self.sb.showMessage(f"Exported {n_beds} beds: {os.path.basename(path)}")
 
     # ── Box reorder ───────────────────────────
 
